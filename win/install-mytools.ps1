@@ -91,6 +91,17 @@ if (Test-Path $ToolsRoot) {
     }
 }
 
+# --- 5. Add bin\ to user PATH ---
+$BinDir = Join-Path $PSScriptRoot "bin"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -notlike "*$BinDir*") {
+    $newPath = if ($userPath) { "$userPath;$BinDir" } else { $BinDir }
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    Write-Ok "Added to user PATH: $BinDir"
+} else {
+    Write-Ok "Already in user PATH: $BinDir"
+}
+
 Write-Host ""
 Write-Host "[+] MyTools framework installed successfully." -ForegroundColor Green
 Write-Host "    Right-click scenarios: Folder | Folder background | File | Drive | Desktop"

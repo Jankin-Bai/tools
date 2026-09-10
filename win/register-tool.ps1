@@ -47,6 +47,8 @@ $manifestPath = Join-Path $ToolDir "tool.json"
 if (-not (Test-Path $manifestPath)) {
     throw "tool.json not found in $ToolDir"
 }
+# Resolve to absolute path so {ToolDir} produces a stable, working command
+$ToolDir = (Resolve-Path $ToolDir).Path
 $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
 $Name        = $manifest.Name
 $DisplayName = $manifest.DisplayName
@@ -78,27 +80,109 @@ foreach ($ctx in $contexts) {
 }
 
 # --- Register in each submenu ---
+$hasSubcommands = $manifest.Subcommands -and @($manifest.Subcommands).Count -gt 0
 $registered = @()
+
 foreach ($subMenu in $bySubMenu.Keys) {
     $param = $bySubMenu[$subMenu]
-    $command = $Template -replace "\{ToolDir\}", $ToolDir -replace "\{PathParam\}", $param
+    $baseCommand = $Template -replace "\{ToolDir\}", $ToolDir -replace "\{PathParam\}", $param
 
-    $toolKey = "HKCU:\Software\Classes\$subMenu\shell\$Name"
-    if (-not (Test-Path -LiteralPath $toolKey)) {
-        New-Item -Path $toolKey -Force | Out-Null
+    if ($hasSubcommands) {
+        # --- Cascading submenu: parent key has ExtendedSubCommandsKey, no command ---
+        $toolKey = "HKCU:\Software\Classes\$subMenu\shell\$Name"
+        if (-not (Test-Path -LiteralPath $toolKey)) {
+            New-Item -Path $toolKey -Force | Out-Null
+        }
+        Set-ItemProperty -LiteralPath $toolKey -Name "MUIVerb" -Value $DisplayName
+        Set-ItemProperty -LiteralPath $toolKey -Name "Icon"    -Value $Icon
+        Set-ItemProperty -LiteralPath $toolKey -Name "ExtendedSubCommandsKey" -Value "${Name}Menu"
+        # Ensure no leftover command subkey (would break cascading)
+        $cmdKey = Join-Path $toolKey "command"
+        if (Test-Path -LiteralPath $cmdKey) { Remove-Item -LiteralPath $cmdKey -Recurse -Force }
+
+        # --- Create submenu root and child entries ---
+        $subRoot = "HKCU:\Software\Classes\${Name}Menu\shell"
+        if (-not (Test-Path -LiteralPath $subRoot)) {
+            New-Item -Path $subRoot -Force | Out-Null
+        }
+
+        foreach ($sub in $manifest.Subcommands) {
+            $subName = "$Name-$($sub.Name)"
+            $subKey = Join-Path $subRoot $subName
+            if (-not (Test-Path -LiteralPath $subKey)) {
+                New-Item -Path $subKey -Force | Out-Null
+            }
+            Set-ItemProperty -LiteralPath $subKey -Name "MUIVerb" -Value $sub.DisplayName
+            if ($sub.Icon) {
+                Set-ItemProperty -LiteralPath $subKey -Name "Icon" -Value $sub.Icon
+            }
+            # AppliesTo: AQS predicate to filter when this submenu item is visible
+            # e.g. "System.FileExtension:.py OR System.FileName:Makefile"
+            if ($sub.AppliesTo) {
+                Set-ItemProperty -LiteralPath $subKey -Name "AppliesTo" -Value $sub.AppliesTo
+            } elseif ((Get-ItemProperty -LiteralPath $subKey -Name "AppliesTo" -ErrorAction SilentlyContinue)) {
+                # Remove stale AppliesTo from a previous registration
+                Remove-ItemProperty -LiteralPath $subKey -Name "AppliesTo" -ErrorAction SilentlyContinue
+            }
+
+            $subCmdKey = Join-Path $subKey "command"
+            if (-not (Test-Path -LiteralPath $subCmdKey)) {
+                New-Item -Path $subCmdKey -Force | Out-Null
+            }
+            $subCommand = $baseCommand
+            if ($sub.Args) {
+                $subCommand += " -ExtraArgs `"$($sub.Args)`""
+            }
+            Set-ItemProperty -LiteralPath $subCmdKey -Name "(Default)" -Value $subCommand
+        }
+
+        $registered += "$subMenu(submenu:$($manifest.Subcommands.Count) items)"
     }
-    Set-ItemProperty -LiteralPath $toolKey -Name "MUIVerb" -Value $DisplayName
-    Set-ItemProperty -LiteralPath $toolKey -Name "Icon"    -Value $Icon
+    else {
+        # --- Single command entry (existing behavior) ---
+        $toolKey = "HKCU:\Software\Classes\$subMenu\shell\$Name"
+        if (-not (Test-Path -LiteralPath $toolKey)) {
+            New-Item -Path $toolKey -Force | Out-Null
+        }
+        Set-ItemProperty -LiteralPath $toolKey -Name "MUIVerb" -Value $DisplayName
+        Set-ItemProperty -LiteralPath $toolKey -Name "Icon"    -Value $Icon
 
-    $cmdKey = Join-Path $toolKey "command"
-    if (-not (Test-Path -LiteralPath $cmdKey)) {
-        New-Item -Path $cmdKey -Force | Out-Null
+        $cmdKey = Join-Path $toolKey "command"
+        if (-not (Test-Path -LiteralPath $cmdKey)) {
+            New-Item -Path $cmdKey -Force | Out-Null
+        }
+        Set-ItemProperty -LiteralPath $cmdKey -Name "(Default)" -Value $baseCommand
+
+        $registered += "$subMenu($param)"
     }
-    Set-ItemProperty -LiteralPath $cmdKey -Name "(Default)" -Value $command
-
-    $registered += "$subMenu($param)"
 }
 
 Write-Host "[+] Registered '$DisplayName' as MyTools\$Name" -ForegroundColor Green
 Write-Host "    Contexts: $($contexts -join ', ')" -ForegroundColor DarkGray
 Write-Host "    Submenus: $($registered -join ', ')" -ForegroundColor DarkGray
+
+# --- Generate CLI shim in bin\ (relative path via %~dp0 for portability) ---
+$BinDir = Join-Path $PSScriptRoot "bin"
+if (-not (Test-Path $BinDir)) { New-Item -ItemType Directory -Path $BinDir -Force | Out-Null }
+
+# Use the explicit Script field from tool.json (single source of truth)
+$scriptName = $manifest.Script
+if (-not $scriptName) {
+    Write-Host "    [!] No 'Script' field in tool.json; skipping shim" -ForegroundColor Yellow
+} else {
+    $ps1Path = Join-Path $ToolDir $scriptName
+    if (-not (Test-Path $ps1Path)) {
+        Write-Host "    [!] Script not found: $ps1Path; skipping shim" -ForegroundColor Yellow
+    } else {
+        # Compute relative path from bin\ to the .ps1 so shims are portable.
+        # [IO.Path]::GetRelativePath is not available in .NET Framework (PS 5.1), use Uri.
+        $fromUri = New-Object System.Uri(($BinDir.TrimEnd('\') + '\'))
+        $toUri = New-Object System.Uri($ps1Path)
+        $relPath = [System.Uri]::UnescapeDataString($fromUri.MakeRelativeUri($toUri).ToString()) -replace '/', '\'
+        $shimPath = Join-Path $BinDir "$Name.cmd"
+        # %~dp0 = directory of this .cmd (bin\), with trailing backslash
+        $shimContent = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0$relPath`" %* -NoPause`r`n"
+        Set-Content -Path $shimPath -Value $shimContent -Encoding ASCII
+        Write-Host "    CLI shim: $shimPath (relative: $relPath)" -ForegroundColor DarkGray
+    }
+}

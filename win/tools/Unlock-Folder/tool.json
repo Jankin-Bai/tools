@@ -3,7 +3,27 @@
   "DisplayName": "Unlock",
   "Icon": "shell32.dll,47",
   "CommandTemplate": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{ToolDir}\\Unlock-Folder.ps1\" -Path \"{PathParam}\"",
+  "Script": "Unlock-Folder.ps1",
   "Contexts": ["Folder", "FolderBackground", "File"],
   "AppliesTo": "Files and Folders",
-  "Description": "Unlock a file or folder: detect locking processes (handles + loaded DLLs), terminate, fallback to delete-on-reboot"
+  "Description": "Unlock a file or folder: detect locking processes (handles + loaded DLLs), terminate, fallback to delete-on-reboot",
+  "Mcp": {
+    "Enabled": true,
+    "Description": "Detect and optionally terminate processes locking a file or folder. Without force: detection only, returns status 'needs_confirmation' with lock details. With force: proceeds with graceful shutdown then force termination. Destructive: may kill user processes.",
+    "InputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Absolute path to the file or folder to unlock"
+        },
+        "force": {
+          "type": "boolean",
+          "description": "If true, automatically terminate locking processes. If false (default), only detect and report locks.",
+          "default": false
+        }
+      },
+      "required": ["path"]
+    }
+  }
 }

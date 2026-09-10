@@ -4,38 +4,43 @@
     delete-on-reboot.
 
 .DESCRIPTION
-    Works on both files and folders. Detection layers:
-      1. Restart Manager API (graceful shutdown)
-      2. Sysinternals handle.exe (file/directory handles)
-      3. Process module scan (loaded DLLs from the target path)
-    After killing processes, re-scans to verify locks are released.
-    If locks persist, offers to mark the file/folder for deletion on next reboot.
-
-    Launched from "My Tools > Unlock" right-click context menu (files and folders).
+    Pipeline architecture: Detect -> Terminate -> Verify.
+    Detection layers: Restart Manager API, Sysinternals handle.exe, module scan.
 
 .PARAMETER Path
-    Full path of the file or folder to unlock. Passed automatically as "%1".
+    Full path of the file or folder to unlock.
+
+.PARAMETER NoPause
+    Skip the final Read-Host pause. Used by CLI .cmd shims and MCP.
+
+.PARAMETER Json
+    Machine-readable JSON output. Without -Force: detection only.
+
+.PARAMETER Force
+    Auto-confirm all destructive actions (use with -Json for MCP automation).
 
 .NOTES
-    handle.exe is downloaded automatically to ..\..\bin\ if missing.
     Debug log: %TEMP%\unlock-debug.log
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Path
+    [Parameter(Mandatory = $true, Position = 0)]
+    [string]$Path,
+    [switch]$NoPause,
+    [switch]$Json,
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
-
-# --- Resolve paths ---
 $ScriptDir = Split-Path $MyInvocation.MyCommand.Path -Parent
-$BinDir    = Join-Path $ScriptDir "..\..\bin"
-$BinDir    = (Resolve-Path $BinDir).Path
+$BinDir    = (Resolve-Path (Join-Path $ScriptDir "..\..\bin")).Path
+
+Import-Module (Join-Path $ScriptDir "..\_shared\MyTools.Common.psm1") -Force
+Set-MyToolsMode -Json:$Json -DebugLogName "unlock"
 
 # ============================================================
-# P/Invoke: Restart Manager + MoveFileEx (delete on reboot)
+# P/Invoke: Restart Manager + MoveFileEx
 # ============================================================
 $rmCode = @"
 using System;
@@ -73,36 +78,166 @@ public static class Kernel32 {
     public const int MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
 }
 "@
-
-try {
-    Add-Type -TypeDefinition $rmCode -ErrorAction Stop
-} catch {
-    Write-Host "FATAL: Failed to compile P/Invoke types: $_" -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
-Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+try { Add-Type -TypeDefinition $rmCode -ErrorAction Stop } catch { throw "P/Invoke compile failed: $_" }
 
 # ============================================================
-# Helpers
+# Pipeline Phase 1+2: Detection
 # ============================================================
-function Show-Message {
-    param(
-        [string]$Text,
-        [string]$Title = "Unlock",
-        [System.Windows.Forms.MessageBoxButtons]$Buttons = [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]$Icon = [System.Windows.Forms.MessageBoxIcon]::Information
-    )
-    return [System.Windows.Forms.MessageBox]::Show($Text, $Title, $Buttons, $Icon)
+function Invoke-Detection {
+    param([string]$TargetPath, [bool]$IsFolder)
+
+    $allLocks = @()
+
+    # --- Phase 1: Restart Manager ---
+    if (-not $Json) { Write-Host "`nPhase 1: Restart Manager..." -ForegroundColor Cyan }
+    Write-DebugLog "Phase 1 started"
+
+    $resources = New-Object System.Collections.Generic.List[string]
+    $resources.Add($TargetPath)
+    if ($IsFolder) {
+        $fileCount = 0
+        try {
+            $allFiles = [System.IO.Directory]::EnumerateFiles($TargetPath, "*", [System.IO.SearchOption]::AllDirectories)
+            foreach ($f in $allFiles) {
+                if ($fileCount -ge 5000) { break }
+                $resources.Add($f); $fileCount++
+            }
+        } catch { }
+        Write-DebugLog "  Registered $($resources.Count) resources"
+    }
+
+    $sessionHandle = 0
+    $rmSurvivors = @()
+    $hr = [RestartManager]::RmStartSession([ref]$sessionHandle, 0, [Guid]::NewGuid().ToString())
+    if ($hr -eq 0) {
+        [RestartManager]::RmRegisterResources($sessionHandle, $resources.Count, $resources.ToArray(), 0, $null, 0, $null) | Out-Null
+        $needed = 0; $count = 0; $reboot = 0
+        [RestartManager]::RmGetList($sessionHandle, [ref]$needed, [ref]$count, $null, [ref]$reboot) | Out-Null
+        $rmProcesses = @()
+        if ($needed -gt 0) {
+            $procInfo = New-Object RestartManager+RM_PROCESS_INFO[] $needed
+            $count = $needed
+            [RestartManager]::RmGetList($sessionHandle, [ref]$needed, [ref]$count, $procInfo, [ref]$reboot) | Out-Null
+            foreach ($p in $procInfo) {
+                if ($p.Process.dwProcessId -gt 0) {
+                    $rmProcesses += [PSCustomObject]@{
+                        PID = $p.Process.dwProcessId; Name = $p.strAppName
+                        Critical = ($p.ApplicationType -eq [RestartManager+RM_APP_TYPE]::RmCritical)
+                    }
+                }
+            }
+        }
+        Write-DebugLog "  Restart Manager found $($rmProcesses.Count) process(es)"
+
+        if ($rmProcesses.Count -gt 0) {
+            $closable = $rmProcesses | Where-Object { -not $_.Critical }
+            $procList = ($closable | ForEach-Object { "  - $($_.Name) (PID $($_.PID))" }) -join "`n"
+            if ((Show-Message -Text "Restart Manager found $($closable.Count) process(es):`n$procList`n`nAttempt graceful shutdown?" -Title "Unlock" -Buttons YesNo -Icon Question) -eq "Yes") {
+                $hr = [RestartManager]::RmShutdown($sessionHandle, 0, [IntPtr]::Zero)
+                Write-DebugLog "  RmShutdown returned 0x$('{0:X}' -f $hr)"
+                Start-Sleep -Seconds 2
+                foreach ($rp in $closable) {
+                    if (Get-Process -Id $rp.PID -ErrorAction SilentlyContinue) {
+                        $rmSurvivors += [PSCustomObject]@{ ProcessName=$rp.Name; PID=$rp.PID; HandleType="RMSurvivor"; TargetPath=$TargetPath }
+                    }
+                }
+            } else {
+                foreach ($rp in $closable) {
+                    $rmSurvivors += [PSCustomObject]@{ ProcessName=$rp.Name; PID=$rp.PID; HandleType="RMSurvivor"; TargetPath=$TargetPath }
+                }
+            }
+        }
+        [RestartManager]::RmEndSession($sessionHandle) | Out-Null
+    }
+
+    # --- Phase 2: handle.exe + module scan ---
+    if (-not $Json) { Write-Host "`nPhase 2: Detecting remaining locks..." -ForegroundColor Cyan }
+    Write-DebugLog "Phase 2 started"
+
+    $handleExe = Get-HandleExePath
+    if (-not $handleExe) { throw "handle.exe not found in: $BinDir" }
+
+    $allLocks += Invoke-HandleScan -TargetPath $TargetPath -HandleExe $handleExe
+    $allLocks += Get-LockingModules -TargetPath $TargetPath -IsFolder $IsFolder
+    $allLocks += $rmSurvivors
+
+    $lockPids = $allLocks | Select-Object -ExpandProperty PID -Unique
+    Write-DebugLog "  Total unique locking PIDs: $($lockPids.Count)"
+    $allLocks | ForEach-Object { Write-DebugLog "    Lock: $($_.ProcessName) PID=$($_.PID) [$($_.HandleType)]" }
+
+    return @{ Locks = $allLocks; LockPids = $lockPids; HandleExe = $handleExe }
 }
 
-function Test-Admin {
-    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# ============================================================
+# Pipeline Phase 3: Termination
+# ============================================================
+function Invoke-Termination {
+    param([object[]]$LockPids)
+
+    $killed = @(); $failed = @()
+    $targets = @()
+
+    foreach ($pidVal in $LockPids) {
+        $proc = Get-Process -Id $pidVal -ErrorAction SilentlyContinue
+        if ($proc) {
+            $isCritical = $proc.ProcessName -match "^(csrss|smss|wininit|winlogon|services|lsass|System|Registry|fontdrvhost)$"
+            if (-not $isCritical) {
+                $targets += [PSCustomObject]@{ ProcessName = $proc.ProcessName; PID = $pidVal }
+            } else {
+                Write-DebugLog "  Skipping critical: $($proc.ProcessName) PID=$pidVal"
+            }
+        }
+    }
+
+    if ($targets.Count -eq 0) { return @{ Killed = @(); Failed = @() } }
+
+    if (-not $Json) { Write-Host "`nPhase 3: Terminating locks..." -ForegroundColor Cyan }
+    $list = ($targets | ForEach-Object { "  - $($_.ProcessName).exe (PID $($_.PID))" }) -join "`n"
+    if ((Show-Message -Text "Terminate $($targets.Count) process(es)?`n`n$list`n`nUnsaved data will be lost." -Title "Unlock" -Buttons YesNo -Icon Warning) -ne "Yes") {
+        Write-DebugLog "  User cancelled termination"
+        return @{ Killed = @(); Failed = @(); Cancelled = $true }
+    }
+
+    foreach ($t in $targets) {
+        try {
+            Stop-Process -Id $t.PID -Force -ErrorAction Stop
+            $killed += $t
+        } catch {
+            $failed += "$($t.ProcessName) (PID $($t.PID)): $_"
+        }
+    }
+    Write-DebugLog "  Killed: $($killed.Count), Failed: $($failed.Count)"
+
+    if ($killed | Where-Object { $_.ProcessName -eq "explorer" }) {
+        Start-Sleep 1
+        if (-not (Get-Process -Name "explorer" -ErrorAction SilentlyContinue)) { Start-Process "explorer.exe" }
+    }
+    Start-Sleep -Seconds 1
+
+    return @{ Killed = $killed; Failed = $failed; Cancelled = $false }
 }
 
+# ============================================================
+# Pipeline Phase 4: Verification
+# ============================================================
+function Invoke-Verification {
+    param([string]$TargetPath, [bool]$IsFolder, [string]$HandleExe)
+
+    if (-not $Json) { Write-Host "`nPhase 4: Verifying..." -ForegroundColor Cyan }
+    Write-DebugLog "Phase 4: re-scanning"
+
+    $verifyLocks = Invoke-HandleScan -TargetPath $TargetPath -HandleExe $HandleExe
+    $verifyModules = Get-LockingModules -TargetPath $TargetPath -IsFolder $IsFolder
+    $remaining = @($verifyLocks) + @($verifyModules)
+    $remainingPids = $remaining | Select-Object -ExpandProperty PID -Unique
+    Write-DebugLog "  Remaining after kill: $($remainingPids.Count) PID(s)"
+
+    return @{ Remaining = $remaining; RemainingPids = $remainingPids }
+}
+
+# ============================================================
+# Detection helpers
+# ============================================================
 function Get-HandleExePath {
     $exeName = if ([Environment]::Is64BitOperatingSystem) { "handle64.exe" } else { "handle.exe" }
     $exePath = Join-Path $BinDir $exeName
@@ -121,46 +256,36 @@ function Invoke-HandleScan {
     foreach ($line in $output) {
         if ($line -match '^(\S+\.exe)\s+pid:\s+(\d+)\s+type:\s+(\S+)\s+([0-9A-Fa-f]+):\s+(.+)$') {
             $results += [PSCustomObject]@{
-                ProcessName = $Matches[1]
-                PID         = [int]$Matches[2]
-                HandleType  = $Matches[3]
-                TargetPath  = $Matches[5].Trim()
+                ProcessName = $Matches[1]; PID = [int]$Matches[2]
+                HandleType = $Matches[3]; TargetPath = $Matches[5].Trim()
             }
         }
     }
+    Write-DebugLog "  handle.exe: $($results.Count) handle(s)"
     return $results
 }
 
 function Get-LockingModules {
     param([string]$TargetPath, [bool]$IsFolder)
     Write-DebugLog "  Scanning loaded modules (tasklist /m) ..."
-    $results = @()
-    $dllsToCheck = @()
-
+    $results = @(); $dllsToCheck = @()
     if ($IsFolder) {
-        # Enumerate DLLs in folder (top 200) and check each
         try {
             $dlls = [System.IO.Directory]::EnumerateFiles($TargetPath, "*.dll", [System.IO.SearchOption]::AllDirectories) | Select-Object -First 200
             foreach ($dll in $dlls) { $dllsToCheck += [System.IO.Path]::GetFileName($dll) }
         } catch { }
     } else {
-        # Single file: if it's a DLL, check by name
         $ext = [System.IO.Path]::GetExtension($TargetPath).ToLower()
-        if ($ext -eq ".dll" -or $ext -eq ".exe") {
-            $dllsToCheck += [System.IO.Path]::GetFileName($TargetPath)
-        }
+        if ($ext -eq ".dll" -or $ext -eq ".exe") { $dllsToCheck += [System.IO.Path]::GetFileName($TargetPath) }
     }
-
     foreach ($dllName in $dllsToCheck) {
         try {
             $output = & tasklist /m $dllName /fo csv /nh 2>$null
             foreach ($line in $output) {
                 if ($line -match '^"([^"]+)",\s*(\d+),') {
                     $results += [PSCustomObject]@{
-                        ProcessName = $Matches[1] -replace '\.exe$',''
-                        PID         = [int]$Matches[2]
-                        HandleType  = "LoadedModule"
-                        TargetPath  = $dllName
+                        ProcessName = $Matches[1] -replace '\.exe$',''; PID = [int]$Matches[2]
+                        HandleType = "LoadedModule"; TargetPath = $dllName
                     }
                 }
             }
@@ -171,267 +296,128 @@ function Get-LockingModules {
 }
 
 # ============================================================
-# Debug logging
-# ============================================================
-$DebugLog = Join-Path $env:TEMP "unlock-debug.log"
-function Write-DebugLog {
-    param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "[$timestamp] $Message"
-    Add-Content -Path $DebugLog -Value $line -Encoding UTF8
-    Write-Host $line
-}
-Write-DebugLog "=== Unlock started ==="
-Write-DebugLog "Path: $Path"
-Write-DebugLog "PSVersion: $($PSVersionTable.PSVersion)"
-
-# ============================================================
-# Main
+# Main: orchestrate the pipeline
 # ============================================================
 function Main {
+    $result = New-ToolResult -Status "running" -Target $Path
+    $result["target_type"] = $null
+    $result["locked_by"] = @()
+    $result["terminated"] = @()
+    $result["failed"] = @()
 
-# --- Validate ---
-if (-not (Test-Path $Path)) {
-    Show-Message -Text "Path not found:`n$Path" -Icon Error
-    throw "Path not found: $Path"
-}
-$item = Get-Item $Path -ErrorAction SilentlyContinue
-$isFolder = $item.PSIsContainer
-Write-DebugLog "Target type: $(if ($isFolder) {'Folder'} else {'File'})"
+    Write-DebugLog "=== Unlock started ==="
+    Write-DebugLog "Path: $Path"
+    Write-DebugLog "PSVersion: $($PSVersionTable.PSVersion)"
+    Write-DebugLog "Mode: $(if ($Json) {'JSON'} elseif ($NoPause) {'CLI'} else {'Interactive'}) Force=$Force"
 
-if (-not (Test-Admin)) {
-    Show-Message -Text "Not running as Administrator.`nSome locks may not be visible.`n`nFor full results, re-run elevated." -Icon Warning
-    Write-DebugLog "WARNING: Not admin"
-}
-
-# --- Build resource list for Restart Manager ---
-$resources = New-Object System.Collections.Generic.List[string]
-$resources.Add($Path)
-if ($isFolder) {
-    $fileLimit = 5000
-    $fileCount = 0
-    Write-Host "  Enumerating files recursively..." -ForegroundColor DarkGray
-    try {
-        $allFiles = [System.IO.Directory]::EnumerateFiles($Path, "*", [System.IO.SearchOption]::AllDirectories)
-        foreach ($f in $allFiles) {
-            if ($fileCount -ge $fileLimit) { Write-Warning "  File limit reached."; break }
-            $resources.Add($f); $fileCount++
-        }
-    } catch { }
-    Write-DebugLog "  Registered $($resources.Count) resources (folder + files)"
-}
-
-# ============================================================
-# Phase 1: Restart Manager graceful shutdown
-# ============================================================
-Write-Host "`nPhase 1: Restart Manager..." -ForegroundColor Cyan
-Write-DebugLog "Phase 1 started"
-
-$sessionHandle = 0
-$rmSurvivors = @()
-$hr = [RestartManager]::RmStartSession([ref]$sessionHandle, 0, [Guid]::NewGuid().ToString())
-if ($hr -eq 0) {
-    $hr = [RestartManager]::RmRegisterResources($sessionHandle, $resources.Count, $resources.ToArray(), 0, $null, 0, $null)
-    if ($hr -eq 0) {
-        $needed = 0; $count = 0; $reboot = 0
-        [RestartManager]::RmGetList($sessionHandle, [ref]$needed, [ref]$count, $null, [ref]$reboot) | Out-Null
-        $rmProcesses = @()
-        if ($needed -gt 0) {
-            $procInfo = New-Object RestartManager+RM_PROCESS_INFO[] $needed
-            $count = $needed
-            [RestartManager]::RmGetList($sessionHandle, [ref]$needed, [ref]$count, $procInfo, [ref]$reboot) | Out-Null
-            foreach ($p in $procInfo) {
-                if ($p.Process.dwProcessId -gt 0) {
-                    $rmProcesses += [PSCustomObject]@{
-                        PID = $p.Process.dwProcessId; Name = $p.strAppName
-                        Critical = ($p.ApplicationType -eq [RestartManager+RM_APP_TYPE]::RmCritical)
-                    }
-                }
-            }
-        }
-        Write-DebugLog "  Restart Manager found $($rmProcesses.Count) process(es)"
-        $rmProcesses | ForEach-Object { Write-DebugLog "    RM: $($_.Name) PID=$($_.PID) Critical=$($_.Critical)" }
-
-        if ($rmProcesses.Count -gt 0) {
-            $closable = $rmProcesses | Where-Object { -not $_.Critical }
-            $critical = $rmProcesses | Where-Object { $_.Critical }
-            $procList = ($closable | ForEach-Object { "  - $($_.Name) (PID $($_.PID))" }) -join "`n"
-            $msg = "Restart Manager found $($closable.Count) process(es):`n$procList"
-            if ($critical) { $msg += "`n`nSkipping $($critical.Count) critical processes." }
-            $msg += "`n`nAttempt graceful shutdown?"
-            if ((Show-Message -Text $msg -Buttons YesNo -Icon Question) -eq "Yes") {
-                $hr = [RestartManager]::RmShutdown($sessionHandle, 0, [IntPtr]::Zero)
-                Write-DebugLog "  RmShutdown returned 0x$('{0:X}' -f $hr)"
-                Start-Sleep -Seconds 2
-                # Check which RM processes are still alive (survivors need force-kill)
-                foreach ($rp in $closable) {
-                    $stillAlive = Get-Process -Id $rp.PID -ErrorAction SilentlyContinue
-                    if ($stillAlive) {
-                        $rmSurvivors += [PSCustomObject]@{
-                            ProcessName = $rp.Name; PID = $rp.PID
-                            HandleType = "RMSurvivor"; TargetPath = $Path
-                        }
-                        Write-DebugLog "  RM survivor (still running): $($rp.Name) PID=$($rp.PID)"
-                    }
-                }
-            } else {
-                # User declined graceful shutdown — all closable processes are survivors
-                foreach ($rp in $closable) {
-                    $rmSurvivors += [PSCustomObject]@{
-                        ProcessName = $rp.Name; PID = $rp.PID
-                        HandleType = "RMSurvivor"; TargetPath = $Path
-                    }
-                }
-            }
-        }
+    # --- Validate ---
+    if (-not (Test-Path $Path)) {
+        $result.errors += "Path not found: $Path"
+        Show-Message -Text "Path not found:`n$Path" -Title "Unlock" -Icon Error
+        throw "Path not found: $Path"
     }
-    [RestartManager]::RmEndSession($sessionHandle) | Out-Null
-}
+    $item = Get-Item $Path -ErrorAction SilentlyContinue
+    $isFolder = $item.PSIsContainer
+    $result.target_type = if ($isFolder) { "folder" } else { "file" }
+    Write-DebugLog "Target type: $(if ($isFolder) {'Folder'} else {'File'})"
 
-# ============================================================
-# Phase 2: handle.exe + module scan
-# ============================================================
-Write-Host "`nPhase 2: Detecting remaining locks..." -ForegroundColor Cyan
-Write-DebugLog "Phase 2 started"
-
-$handleExe = Get-HandleExePath
-if (-not $handleExe) {
-    Show-Message -Text "handle.exe not found in:`n$BinDir" -Icon Error
-    throw "handle.exe not found"
-}
-
-$allLocks = @()
-
-# 2a: handle.exe scan
-$handleLocks = Invoke-HandleScan -TargetPath $Path -HandleExe $handleExe
-Write-DebugLog "  handle.exe: $($handleLocks.Count) handle(s)"
-$allLocks += $handleLocks
-
-# 2b: module scan via tasklist /m (works for both 32-bit and 64-bit processes)
-$moduleLocks = Get-LockingModules -TargetPath $Path -IsFolder $isFolder
-Write-DebugLog "  Module scan: $($moduleLocks.Count) loaded module(s)"
-$allLocks += $moduleLocks
-
-# 2c: RM survivors (processes RmShutdown failed to close, or user declined)
-if ($rmSurvivors.Count -gt 0) {
-    Write-DebugLog "  RM survivors: $($rmSurvivors.Count) process(es) still holding locks"
-    $allLocks += $rmSurvivors
-}
-
-# Deduplicate by PID
-$lockPids = $allLocks | Select-Object -ExpandProperty PID -Unique
-Write-DebugLog "  Total unique locking PIDs: $($lockPids.Count)"
-$allLocks | ForEach-Object { Write-DebugLog "    Lock: $($_.ProcessName) PID=$($_.PID) [$($_.HandleType)] -> $($_.TargetPath)" }
-
-if ($lockPids.Count -eq 0) {
-    $result = Show-Message -Text "No locking processes detected.`n`nThe item may be locked by:`n- Explorer (preview pane / open window)`n- A kernel driver or antivirus`n- A process running as another user`n`nRestart Explorer? Or mark for delete-on-reboot?" -Buttons YesNoCancel -Icon Question
-    if ($result -eq "Yes") {
-        Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue
-        Start-Sleep 2
-        Start-Process "explorer.exe"
-        Show-Message -Text "Explorer restarted. Try your operation again."
-    } elseif ($result -eq "Cancel") {
-        return
-    } else {
-        # No = fall through to delete-on-reboot
-    }
-}
-
-# ============================================================
-# Phase 3: Kill locking processes
-# ============================================================
-if ($lockPids.Count -gt 0) {
-    Write-Host "`nPhase 3: Terminating locks..." -ForegroundColor Cyan
-
-    $targets = @()
-    foreach ($pidVal in $lockPids) {
-        $proc = Get-Process -Id $pidVal -ErrorAction SilentlyContinue
-        if ($proc) {
-            $isCritical = $proc.ProcessName -match "^(csrss|smss|wininit|winlogon|services|lsass|System|Registry|fontdrvhost)$"
-            if (-not $isCritical) {
-                $targets += [PSCustomObject]@{ ProcessName = $proc.ProcessName; PID = $pidVal }
-            } else {
-                Write-DebugLog "  Skipping critical: $($proc.ProcessName) PID=$pidVal"
-            }
-        }
+    if (-not (Test-Admin)) {
+        Show-Message -Text "Not running as Administrator.`nSome locks may not be visible." -Title "Unlock" -Icon Warning
+        Write-DebugLog "WARNING: Not admin"
     }
 
-    if ($targets.Count -gt 0) {
-        $list = ($targets | ForEach-Object { "  - $($_.ProcessName).exe (PID $($_.PID))" }) -join "`n"
-        if ((Show-Message -Text "Terminate $($targets.Count) process(es)?`n`n$list`n`nUnsaved data will be lost." -Buttons YesNo -Icon Warning) -ne "Yes") {
-            Write-DebugLog "  User cancelled termination"
+    # --- Pipeline: Detect ---
+    $detect = Invoke-Detection -TargetPath $Path -IsFolder $isFolder
+    foreach ($lock in $detect.Locks) {
+        $result.locked_by += [ordered]@{ pid=$lock.PID; name=$lock.ProcessName; type=$lock.HandleType; target=$lock.TargetPath }
+    }
+
+    if ($detect.LockPids.Count -eq 0) {
+        if ($Json) {
+            $result.status = "no_locks_detected"
+            return $result
+        }
+        $choice = Show-Message -Text "No locking processes detected.`n`nRestart Explorer? Or mark for delete-on-reboot?" -Title "Unlock" -Buttons YesNoCancel -Icon Question
+        if ($choice -eq "Yes") {
+            Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue
+            Start-Sleep 2; Start-Process "explorer.exe"
+        } elseif ($choice -eq "Cancel") {
+            $result.status = "no_locks_detected"
+            return $result
+        }
+        # "No" falls through to delete-on-reboot
+    }
+
+    # --- Pipeline: Terminate (skip if Json without Force and locks exist) ---
+    if ($detect.LockPids.Count -gt 0) {
+        if ($Json -and -not $Force) {
+            Write-DebugLog "  Json mode without Force: detection only, returning needs_confirmation"
+            $result.status = "needs_confirmation"
+            return $result
+        }
+        $term = Invoke-Termination -LockPids $detect.LockPids
+        if ($term.Cancelled) {
+            $result.status = "needs_confirmation"
+            return $result
+        }
+        foreach ($k in $term.Killed) {
+            $result.terminated += [ordered]@{ pid=$k.PID; name=$k.ProcessName; method="force_kill" }
+        }
+        foreach ($f in $term.Failed) { $result.failed += $f }
+    }
+
+    # --- Pipeline: Verify ---
+    $verify = Invoke-Verification -TargetPath $Path -IsFolder $isFolder -HandleExe $detect.HandleExe
+
+    if ($verify.RemainingPids.Count -eq 0) {
+        $result.status = "ok"
+        Show-Message -Text "All locks released successfully." -Title "Unlock"
+        return $result
+    }
+
+    # --- Locks remain: offer delete-on-reboot ---
+    $remList = ($verify.Remaining | Group-Object PID | ForEach-Object { "  - $($_.Group[0].ProcessName) (PID $($_.Name))" }) -join "`n"
+    if ((Show-Message -Text "Locks still held by:`n$remList`n`nMark for deletion on next reboot?" -Title "Unlock" -Buttons YesNo -Icon Warning) -eq "Yes") {
+        $ok = [Kernel32]::MoveFileEx($Path, $null, [Kernel32]::MOVEFILE_DELAY_UNTIL_REBOOT)
+        if ($ok) {
+            Write-DebugLog "  Marked for delete-on-reboot: $Path"
+            $result.status = "marked_delete_on_reboot"
+            Show-Message -Text "Successfully marked for deletion on next reboot." -Title "Unlock"
         } else {
-            $killed = @(); $failed = @()
-            foreach ($t in $targets) {
-                try { Stop-Process -Id $t.PID -Force -ErrorAction Stop; $killed += $t }
-                catch { $failed += "$($t.ProcessName) (PID $($t.PID)): $_" }
-            }
-            Write-DebugLog "  Killed: $($killed.Count), Failed: $($failed.Count)"
-
-            # Restart Explorer if killed
-            if ($killed | Where-Object { $_.ProcessName -eq "explorer" }) {
-                Start-Sleep 1
-                if (-not (Get-Process -Name "explorer" -ErrorAction SilentlyContinue)) { Start-Process "explorer.exe" }
-            }
-            Start-Sleep -Seconds 1
+            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            $result.errors += "MoveFileEx failed, error=$err"
+            $result.status = "partial"
+            Show-Message -Text "Failed to mark for delete-on-reboot (error $err)." -Title "Unlock" -Icon Error
         }
-    }
-}
-
-# ============================================================
-# Phase 4: Verify + delete-on-reboot fallback
-# ============================================================
-Write-Host "`nPhase 4: Verifying..." -ForegroundColor Cyan
-Write-DebugLog "Phase 4: re-scanning"
-
-$verifyLocks = Invoke-HandleScan -TargetPath $Path -HandleExe $handleExe
-$verifyModules = Get-LockingModules -TargetPath $Path -IsFolder $isFolder
-$remaining = @($verifyLocks) + @($verifyModules)
-$remainingPids = $remaining | Select-Object -ExpandProperty PID -Unique
-
-Write-DebugLog "  Remaining after kill: $($remainingPids.Count) PID(s)"
-
-if ($remainingPids.Count -eq 0) {
-    Show-Message -Text "All locks released successfully.`n`nTry your operation again." -Icon Information
-    return
-}
-
-# Locks still remain — offer delete-on-reboot
-$remList = ($remaining | Group-Object PID | ForEach-Object {
-    $p = $_.Group[0]
-    "  - $($p.ProcessName) (PID $($p.PID))"
-}) -join "`n"
-
-$choice = Show-Message -Text "Locks still held by:`n$remList`n`nThese processes resist termination (may auto-restart).`n`nMark the item for deletion on next reboot?" -Buttons YesNo -Icon Warning
-
-if ($choice -eq "Yes") {
-    $ok = [Kernel32]::MoveFileEx($Path, $null, [Kernel32]::MOVEFILE_DELAY_UNTIL_REBOOT)
-    if ($ok) {
-        Write-DebugLog "  Marked for delete-on-reboot: $Path"
-        Show-Message -Text "Successfully marked for deletion on next reboot.`n`nThe item will be removed automatically when Windows restarts." -Icon Information
     } else {
-        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        Write-DebugLog "  MoveFileEx failed, error=$err"
-        Show-Message -Text "Failed to mark for delete-on-reboot (error $err).`n`nYou may need to run as Administrator." -Icon Error
+        $result.status = "partial"
     }
-}
 
-} # end Main
+    return $result
+}
 
 # ============================================================
 # Entry point
 # ============================================================
 try {
-    Main
+    $result = Main
 } catch {
     $errMsg = $_.Exception.Message
     Write-DebugLog "FATAL ERROR: $errMsg"
     Write-DebugLog "Stack: $($_.ScriptStackTrace)"
-    Write-Host "`n=== ERROR ===" -ForegroundColor Red
-    Write-Host $errMsg -ForegroundColor Red
-    Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
-    try { Show-Message -Text "Error:`n$errMsg`n`nDebug log:`n$DebugLog" -Icon Error } catch { }
+    if (-not $result) { $result = New-ToolResult -Status "error" -Target $Path }
+    $result.status = "error"
+    if ($result.errors -notcontains $errMsg) { $result.errors += $errMsg }
+    if (-not $Json) {
+        Write-Host "`n=== ERROR ===" -ForegroundColor Red
+        Write-Host $errMsg -ForegroundColor Red
+        try { Show-Message -Text "Error:`n$errMsg`n`nDebug log:`n$(Get-DebugLogPath)" -Title "Unlock" -Icon Error } catch { }
+    }
 } finally {
-    Write-Host "`nDebug log: $DebugLog" -ForegroundColor Yellow
-    Read-Host "Press Enter to close"
+    if ($Json) {
+        $result | ConvertTo-Json -Depth 10
+    } else {
+        Write-Host "`nDebug log: $(Get-DebugLogPath)" -ForegroundColor Yellow
+        if (-not $NoPause) { Read-Host "Press Enter to close" }
+    }
 }

@@ -44,6 +44,15 @@ foreach ($sub in $SubMenus) {
     }
 }
 
+# --- Remove bin\ from user PATH ---
+$BinDir = Join-Path $PSScriptRoot "bin"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -like "*$BinDir*") {
+    $cleaned = ($userPath -split ';' | Where-Object { $_ -and $_ -ne $BinDir }) -join ';'
+    [Environment]::SetEnvironmentVariable("Path", $cleaned, "User")
+    Write-Host "[+] Removed from user PATH: $BinDir" -ForegroundColor Green
+}
+
 if ($RemoveFiles) {
     $base = $PSScriptRoot
     Write-Host "[*] Removing framework files under $base ..." -ForegroundColor Cyan

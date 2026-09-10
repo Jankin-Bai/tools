@@ -32,8 +32,22 @@ foreach ($sub in $SubMenus) {
     }
 }
 
+# --- Remove submenu root if this tool used cascading subcommands ---
+$subMenuRoot = "HKCU:\Software\Classes\${Name}Menu"
+if (Test-Path -LiteralPath $subMenuRoot) {
+    Remove-Item -LiteralPath $subMenuRoot -Recurse -Force
+    $removed += "${Name}Menu(submenu root)"
+}
+
 if ($removed.Count -gt 0) {
     Write-Host "[+] Unregistered '$Name' from: $($removed -join ', ')" -ForegroundColor Green
 } else {
     Write-Host "[!] Tool '$Name' not found in any submenu." -ForegroundColor Yellow
+}
+
+# --- Remove CLI shim from bin\ ---
+$shimPath = Join-Path $PSScriptRoot "bin\$Name.cmd"
+if (Test-Path $shimPath) {
+    Remove-Item $shimPath -Force
+    Write-Host "[+] Removed CLI shim: $shimPath" -ForegroundColor Green
 }

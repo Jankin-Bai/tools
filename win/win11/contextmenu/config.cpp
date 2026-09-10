@@ -1,0 +1,26 @@
+#include "config.h"
+
+const ToolConfig g_toolConfigs[TOOL_COUNT] = {
+    { { 0x038763A6, 0x90F5, 0x4540, { 0x81, 0x91, 0xE9, 0x07, 0xBC, 0x64, 0x4C, 0xF2 } }, L"Dep Tree: Text Tree", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"" },
+    { { 0xB5CF9CDA, 0xA68A, 0x4E94, { 0x9D, 0x75, 0x42, 0x08, 0x14, 0x43, 0xB2, 0xE0 } }, L"Dep Tree: JSON", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--json" },
+    { { 0xCBD37E17, 0x4F69, 0x4B4B, { 0x92, 0x8D, 0xDA, 0x5C, 0xB4, 0xFB, 0x4F, 0x2D } }, L"Dep Tree: Mermaid", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mermaid" },
+    { { 0x8C6F4A6B, 0x43E9, 0x4AA4, { 0xB1, 0xB1, 0x29, 0xAF, 0x00, 0xDD, 0xF0, 0x52 } }, L"Dep Tree: Graphviz DOT", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--dot" },
+    { { 0xCAB48479, 0x4174, 0x4242, { 0xAA, 0x46, 0xB1, 0x20, 0xBD, 0xFB, 0x8E, 0x8D } }, L"Dep Tree: Render PNG", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--dot --render png" },
+    { { 0xAC273F38, 0x0A4F, 0x43F9, { 0x84, 0x48, 0x84, 0xCF, 0xC5, 0x41, 0xF5, 0x86 } }, L"Dep Tree: Render SVG", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--dot --render svg" },
+    { { 0xC3955387, 0xC969, 0x4AFF, { 0x95, 0x42, 0x42, 0xB3, 0xF7, 0xC2, 0x84, 0x2E } }, L"Dep Tree: Dirty (mark rebuild)", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--dirty" },
+    { { 0x1DC2DC1A, 0x3C25, 0x434B, { 0x8A, 0x86, 0x82, 0xB1, 0xE5, 0xAE, 0xE2, 0x79 } }, L"Dep Tree: Source: Text Tree", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode source" },
+    { { 0xF1211E3E, 0xFFF4, 0x46BD, { 0xB3, 0x12, 0x8E, 0x22, 0x1B, 0x1B, 0x5D, 0xA8 } }, L"Dep Tree: Source: JSON", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode source --json" },
+    { { 0x3401A450, 0x8C46, 0x48D9, { 0xA0, 0xFF, 0x7A, 0x9F, 0xC5, 0x55, 0x77, 0x64 } }, L"Dep Tree: Source: Mermaid", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode source --mermaid" },
+    { { 0x20E577A9, 0x32D4, 0x4E37, { 0xA6, 0xBA, 0x17, 0x06, 0xB6, 0x39, 0xBC, 0x85 } }, L"Dep Tree: Source: DOT", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode source --dot" },
+    { { 0x629D106F, 0x80A2, 0x4C09, { 0xB5, 0x90, 0x4D, 0xAB, 0x8D, 0x53, 0xFF, 0x99 } }, L"Dep Tree: Source: Render PNG", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode source --dot --render png" },
+    { { 0x9B73DBE8, 0xD40D, 0x43E4, { 0x8F, 0xAD, 0xD9, 0xDE, 0x2F, 0x7E, 0x23, 0x01 } }, L"Dep Tree: Source: Render SVG", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode source --dot --render svg" },
+    { { 0x5872AAE1, 0x8C93, 0x4E3E, { 0x9B, 0x33, 0xFF, 0x69, 0x85, 0xC1, 0xAA, 0xB8 } }, L"Dep Tree: Package: Text Tree", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode package" },
+    { { 0xA61D9602, 0x208D, 0x4D59, { 0x92, 0xF0, 0x3F, 0xF9, 0xA4, 0x9D, 0x33, 0xB5 } }, L"Dep Tree: Package: JSON", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode package --json" },
+    { { 0xF2E988A8, 0x739E, 0x4FD2, { 0xB4, 0xE6, 0x32, 0x22, 0xD4, 0x84, 0x8E, 0x76 } }, L"Dep Tree: Package: Mermaid", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode package --mermaid" },
+    { { 0x5AB3FC1B, 0xDD46, 0x42A1, { 0x95, 0x0E, 0x0A, 0x7D, 0x78, 0x36, 0x20, 0x95 } }, L"Dep Tree: Package: DOT", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode package --dot" },
+    { { 0x45EAA9BF, 0xD8D4, 0x4297, { 0xAC, 0x26, 0x7D, 0x90, 0xE4, 0xD3, 0x81, 0x84 } }, L"Dep Tree: Package: Reverse", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode package --reverse" },
+    { { 0x4B874E17, 0xFBA3, 0x478C, { 0x93, 0xA2, 0xF6, 0xE0, 0x9A, 0x90, 0x20, 0x66 } }, L"Dep Tree: Package: Render PNG", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode package --dot --render png" },
+    { { 0xFE38E429, 0x33A8, 0x4C7D, { 0xBB, 0x69, 0x0E, 0xC4, 0x62, 0x2D, 0x0E, 0xF5 } }, L"Dep Tree: Package: Render SVG", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Dep-Tree\\Dep-Tree.ps1", L"--mode package --dot --render svg" },
+    { { 0x7ED70F56, 0x4B60, 0x4557, { 0xA5, 0x19, 0x32, 0xD4, 0x4A, 0x66, 0x31, 0xAB } }, L"Git Sync", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Git-Sync\\Git-Sync.ps1", L"" },
+    { { 0x119E9275, 0x5F1D, 0x4AAA, { 0xBB, 0x2F, 0xE5, 0xBA, 0xE4, 0xB0, 0x66, 0x49 } }, L"Unlock", L"C:\\Users\\Administrator\\Documents\\tools\\scripts\\win\\tools\\Unlock-Folder\\Unlock-Folder.ps1", L"" }
+};

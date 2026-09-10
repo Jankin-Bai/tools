@@ -1,0 +1,81 @@
+{
+  "Name": "deptree",
+  "DisplayName": "Dep Tree",
+  "Icon": "shell32.dll,154",
+  "CommandTemplate": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{ToolDir}\\Dep-Tree.ps1\" -Path \"{PathParam}\"",
+  "Script": "Dep-Tree.ps1",
+  "Contexts": ["File"],
+  "AppliesTo": "File",
+  "Description": "Analyze the dependency tree of a file (Makefile, Python source, Python packages)",
+  "Subcommands": [
+    {"Name": "text",         "DisplayName": "Text Tree",              "Args": ""},
+    {"Name": "json",         "DisplayName": "JSON",                   "Args": "--json"},
+    {"Name": "mermaid",      "DisplayName": "Mermaid",                "Args": "--mermaid"},
+    {"Name": "dot",          "DisplayName": "Graphviz DOT",           "Args": "--dot"},
+    {"Name": "png",          "DisplayName": "Render PNG",             "Args": "--dot --render png"},
+    {"Name": "svg",          "DisplayName": "Render SVG",             "Args": "--dot --render svg"},
+    {"Name": "dirty",        "DisplayName": "Dirty (mark rebuild)",   "Args": "--dirty",                "AppliesTo": "System.FileName:Makefile OR System.FileExtension:.mk OR System.FileExtension:.mak OR System.FileExtension:.make"},
+    {"Name": "src-text",     "DisplayName": "Source: Text Tree",      "Args": "--mode source",          "AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "src-json",     "DisplayName": "Source: JSON",           "Args": "--mode source --json",   "AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "src-mermaid",  "DisplayName": "Source: Mermaid",        "Args": "--mode source --mermaid","AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "src-dot",      "DisplayName": "Source: DOT",            "Args": "--mode source --dot",    "AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "src-png",      "DisplayName": "Source: Render PNG",     "Args": "--mode source --dot --render png", "AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "src-svg",      "DisplayName": "Source: Render SVG",     "Args": "--mode source --dot --render svg", "AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "pkg-text",     "DisplayName": "Package: Text Tree",     "Args": "--mode package",         "AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
+    {"Name": "pkg-json",     "DisplayName": "Package: JSON",          "Args": "--mode package --json",  "AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
+    {"Name": "pkg-mermaid",  "DisplayName": "Package: Mermaid",       "Args": "--mode package --mermaid","AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
+    {"Name": "pkg-dot",      "DisplayName": "Package: DOT",           "Args": "--mode package --dot",   "AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
+    {"Name": "pkg-reverse",  "DisplayName": "Package: Reverse",       "Args": "--mode package --reverse","AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
+    {"Name": "pkg-png",      "DisplayName": "Package: Render PNG",    "Args": "--mode package --dot --render png", "AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
+    {"Name": "pkg-svg",      "DisplayName": "Package: Render SVG",    "Args": "--mode package --dot --render svg", "AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"}
+  ],
+  "Mcp": {
+    "Enabled": true,
+    "Description": "Analyze the dependency tree of a file. Supports Makefile build dependencies, Python source import dependencies, and Python installed package dependencies. Read-only, no side effects.",
+    "InputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Absolute path to a Makefile, .py file, requirements.txt, or pyproject.toml"
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["auto", "makefile", "source", "package"],
+          "default": "auto",
+          "description": "Analysis mode. auto = detect by file extension"
+        },
+        "format": {
+          "type": "string",
+          "enum": ["text", "json", "mermaid", "dot"],
+          "default": "json",
+          "description": "Output format"
+        },
+        "package_name": {
+          "type": "string",
+          "description": "Package mode: specific package to analyze (omit for all packages)"
+        },
+        "reverse": {
+          "type": "boolean",
+          "default": false,
+          "description": "Package mode: reverse dependency (who depends on this package)"
+        },
+        "python": {
+          "type": "string",
+          "description": "Path to Python executable (default: auto-detect project venv)"
+        },
+        "no_stdlib": {
+          "type": "boolean",
+          "default": false,
+          "description": "Source mode: hide standard library nodes"
+        },
+        "max_depth": {
+          "type": "integer",
+          "default": 10,
+          "description": "Source mode: maximum recursion depth"
+        }
+      },
+      "required": ["path"]
+    }
+  }
+}
