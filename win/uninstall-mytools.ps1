@@ -17,19 +17,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$ParentKey   = "HKCU:\Software\Classes\Directory\shell\MyTools"
-$MenuRootKey = "HKCU:\Software\Classes\MyToolsMenu"
+$FolderParentKey = "HKCU:\Software\Classes\Directory\shell\MyTools"
+$FileParentKey   = "HKCU:\Software\Classes\*\shell\MyTools"
+$MenuRootKey     = "HKCU:\Software\Classes\MyToolsMenu"
 
 Write-Host "[*] Removing My Tools registry entries..." -ForegroundColor Cyan
 
-if (Test-Path $ParentKey) {
-    Remove-Item -Path $ParentKey -Recurse -Force
-    Write-Host "[+] Removed: $ParentKey" -ForegroundColor Green
-}
-
-if (Test-Path $MenuRootKey) {
-    Remove-Item -Path $MenuRootKey -Recurse -Force
-    Write-Host "[+] Removed: $MenuRootKey" -ForegroundColor Green
+foreach ($key in @($FolderParentKey, $FileParentKey, $MenuRootKey)) {
+    if (Test-Path -LiteralPath $key) {
+        Remove-Item -LiteralPath $key -Recurse -Force
+        Write-Host "[+] Removed: $key" -ForegroundColor Green
+    }
 }
 
 if ($RemoveFiles) {

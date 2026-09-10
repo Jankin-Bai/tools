@@ -25,8 +25,23 @@ if (-not $ToolsRoot) { $ToolsRoot = Join-Path $PSScriptRoot "tools" }
 if (-not $BinDir)   { $BinDir   = Join-Path $PSScriptRoot "bin" }
 
 # --- Registry paths (per-user, maps to HKCR) ---
-$ParentKey   = "HKCU:\Software\Classes\Directory\shell\MyTools"
-$MenuRootKey = "HKCU:\Software\Classes\MyToolsMenu\shell"
+$FolderParentKey = "HKCU:\Software\Classes\Directory\shell\MyTools"
+$FileParentKey   = "HKCU:\Software\Classes\*\shell\MyTools"
+$MenuRootKey     = "HKCU:\Software\Classes\MyToolsMenu\shell"
+
+function Register-ParentMenu {
+    param([string]$KeyPath, [string]$Label)
+    # New-Item has no -LiteralPath in PS 5.1; use .NET to avoid wildcard expansion on "*"
+    $regPath = $KeyPath -replace "^HKCU:\\", ""
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($regPath)
+    $key.Close()
+    Set-ItemProperty -LiteralPath $KeyPath -Name "MUIVerb"               -Value "My Tools"
+    Set-ItemProperty -LiteralPath $KeyPath -Name "ExtendedSubCommandsKey" -Value "MyToolsMenu"
+    Set-ItemProperty -LiteralPath $KeyPath -Name "Icon"                  -Value "shell32.dll,14"
+    $cmdSub = Join-Path $KeyPath "command"
+    if (Test-Path -LiteralPath $cmdSub) { Remove-Item -LiteralPath $cmdSub -Recurse -Force }
+    Write-Ok "$Label menu registered"
+}
 
 function Write-Step {
     param([string]$Message)
@@ -43,18 +58,11 @@ function Write-Warn {
     Write-Host "[!] $Message" -ForegroundColor Yellow
 }
 
-# --- 1. Create parent cascading menu ---
+# --- 1. Create parent cascading menu (folders + files) ---
 Write-Step "Registering My Tools cascading menu..."
 
-if (-not (Test-Path $ParentKey)) {
-    New-Item -Path $ParentKey -Force | Out-Null
-}
-Set-ItemProperty -Path $ParentKey -Name "MUIVerb"               -Value "My Tools"
-Set-ItemProperty -Path $ParentKey -Name "ExtendedSubCommandsKey" -Value "MyToolsMenu"
-Set-ItemProperty -Path $ParentKey -Name "Icon"                  -Value "shell32.dll,14"
-# Remove any legacy command subkey so the parent stays a pure container
-$cmdSub = Join-Path $ParentKey "command"
-if (Test-Path $cmdSub) { Remove-Item $cmdSub -Recurse -Force }
+Register-ParentMenu -KeyPath $FolderParentKey -Label "Folder"
+Register-ParentMenu -KeyPath $FileParentKey   -Label "File"
 
 if (-not (Test-Path $MenuRootKey)) {
     New-Item -Path $MenuRootKey -Force | Out-Null

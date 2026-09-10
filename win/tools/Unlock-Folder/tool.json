@@ -1,8 +1,8 @@
 {
-  "Name": "unlockfolder",
-  "DisplayName": "Unlock Folder",
+  "Name": "unlock",
+  "DisplayName": "Unlock",
   "Icon": "shell32.dll,47",
   "CommandTemplate": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{ToolDir}\\Unlock-Folder.ps1\" -Path \"%1\"",
-  "AppliesTo": "Directory",
-  "Description": "Find and terminate processes locking a folder (Sysinternals handle.exe)"
+  "AppliesTo": "Files and Folders",
+  "Description": "Unlock a file or folder: detect locking processes (handles + loaded DLLs), terminate, fallback to delete-on-reboot"
 }
