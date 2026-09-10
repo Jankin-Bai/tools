@@ -3,85 +3,102 @@
     Register a tool into the My Tools right-click cascading menu.
 
 .DESCRIPTION
-    Reads a tool.json manifest from the specified tool directory and creates the
-    corresponding registry entry under HKCU\Software\Classes\MyToolsMenu\shell\.
-    Can also register with explicit parameters without a manifest.
+    Reads a tool.json manifest and registers the tool under the appropriate
+    submenu(s) based on its declared Contexts. Each context maps to a submenu
+    root and a path parameter (%V for folder-type, %1 for item-type).
+
+    Supported Contexts (in tool.json):
+      Folder            Right-click a folder icon
+      FolderBackground  Right-click empty space inside a folder
+      Desktop           Right-click empty space on the desktop
+      File              Right-click any file
+      Drive             Right-click a drive in My Computer
+
+    If Contexts is omitted, defaults to ["Folder", "FolderBackground", "File"].
 
 .PARAMETER ToolDir
     Path to a tool directory containing tool.json.
 
-.PARAMETER Name
-    Unique registry key name for the tool (alphanumeric, no spaces).
-
-.PARAMETER DisplayName
-    Text shown in the context menu.
-
-.PARAMETER Icon
-    Icon reference, e.g. "shell32.dll,47" or a full .ico/.exe path.
-
-.PARAMETER Command
-    Full command line executed when the menu item is clicked. Use "%1" for the
-    selected folder path.
-
 .EXAMPLE
-    .\register-tool.ps1 -ToolDir .\tools\Unlock-Folder
-
-.EXAMPLE
-    .\register-tool.ps1 -Name "mytool" -DisplayName "Do Thing" -Icon "shell32.dll,5" `
-        -Command 'powershell.exe -NoProfile -File "C:\tool.ps1" -Path "%1"'
+    .\register-tool.ps1 -ToolDir .\tools\Git-Sync
 #>
 
-[CmdletBinding(DefaultParameterSetName = "Manifest")]
+[CmdletBinding()]
 param(
-    [Parameter(ParameterSetName = "Manifest", Mandatory = $true)]
-    [string]$ToolDir,
-
-    [Parameter(ParameterSetName = "Explicit", Mandatory = $true)]
-    [string]$Name,
-
-    [Parameter(ParameterSetName = "Explicit", Mandatory = $true)]
-    [string]$DisplayName,
-
-    [Parameter(ParameterSetName = "Explicit")]
-    [string]$Icon = "shell32.dll,0",
-
-    [Parameter(ParameterSetName = "Explicit", Mandatory = $true)]
-    [string]$Command
+    [Parameter(Mandatory = $true)]
+    [string]$ToolDir
 )
 
 $ErrorActionPreference = "Stop"
-$MenuRootKey = "HKCU:\Software\Classes\MyToolsMenu\shell"
 
-# --- Resolve tool definition ---
-if ($PSCmdlet.ParameterSetName -eq "Manifest") {
-    $manifestPath = Join-Path $ToolDir "tool.json"
-    if (-not (Test-Path $manifestPath)) {
-        throw "tool.json not found in $ToolDir"
-    }
-    $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-    $Name        = $manifest.Name
-    $DisplayName = $manifest.DisplayName
-    $Icon        = if ($manifest.Icon) { $manifest.Icon } else { "shell32.dll,0" }
-    $Command     = $manifest.CommandTemplate -replace "\{ToolDir\}", $ToolDir
+# --- Context -> submenu + parameter mapping ---
+$ContextMap = @{
+    "Folder"           = @{ SubMenu = "MyToolsMenu";      Param = "%V" }
+    "FolderBackground" = @{ SubMenu = "MyToolsMenu";      Param = "%V" }
+    "Desktop"          = @{ SubMenu = "MyToolsMenu";      Param = "%V" }
+    "File"             = @{ SubMenu = "MyToolsMenuFile";  Param = "%1" }
+    "Drive"            = @{ SubMenu = "MyToolsMenuDrive"; Param = "%1" }
 }
 
-# --- Validate name ---
+$DefaultContexts = @("Folder", "FolderBackground", "File")
+
+# --- Resolve tool definition ---
+$manifestPath = Join-Path $ToolDir "tool.json"
+if (-not (Test-Path $manifestPath)) {
+    throw "tool.json not found in $ToolDir"
+}
+$manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+$Name        = $manifest.Name
+$DisplayName = $manifest.DisplayName
+$Icon        = if ($manifest.Icon) { $manifest.Icon } else { "shell32.dll,0" }
+$Template    = $manifest.CommandTemplate
+
+# --- Validate ---
 if ($Name -notmatch "^[a-zA-Z0-9_-]+$") {
     throw "Tool name '$Name' must be alphanumeric (hyphens/underscores allowed)."
 }
-
-# --- Create registry entry ---
-$toolKey = Join-Path $MenuRootKey $Name
-if (-not (Test-Path $toolKey)) {
-    New-Item -Path $toolKey -Force | Out-Null
+if (-not $Template) {
+    throw "CommandTemplate is required in tool.json"
 }
-Set-ItemProperty -Path $toolKey -Name "MUIVerb" -Value $DisplayName
-Set-ItemProperty -Path $toolKey -Name "Icon"    -Value $Icon
 
-$cmdKey = Join-Path $toolKey "command"
-if (-not (Test-Path $cmdKey)) {
-    New-Item -Path $cmdKey -Force | Out-Null
+# --- Resolve contexts ---
+$contexts = if ($manifest.Contexts) { @($manifest.Contexts) } else { $DefaultContexts }
+$invalid = $contexts | Where-Object { -not $ContextMap.ContainsKey($_) }
+if ($invalid) {
+    throw "Unknown context(s): $($invalid -join ', '). Valid: $($ContextMap.Keys -join ', ')"
 }
-Set-ItemProperty -Path $cmdKey -Name "(Default)" -Value $Command
+
+# --- Group by submenu (a tool may register in multiple submenus with different params) ---
+$bySubMenu = @{}
+foreach ($ctx in $contexts) {
+    $sub = $ContextMap[$ctx].SubMenu
+    if (-not $bySubMenu.ContainsKey($sub)) {
+        $bySubMenu[$sub] = $ContextMap[$ctx].Param
+    }
+}
+
+# --- Register in each submenu ---
+$registered = @()
+foreach ($subMenu in $bySubMenu.Keys) {
+    $param = $bySubMenu[$subMenu]
+    $command = $Template -replace "\{ToolDir\}", $ToolDir -replace "\{PathParam\}", $param
+
+    $toolKey = "HKCU:\Software\Classes\$subMenu\shell\$Name"
+    if (-not (Test-Path -LiteralPath $toolKey)) {
+        New-Item -Path $toolKey -Force | Out-Null
+    }
+    Set-ItemProperty -LiteralPath $toolKey -Name "MUIVerb" -Value $DisplayName
+    Set-ItemProperty -LiteralPath $toolKey -Name "Icon"    -Value $Icon
+
+    $cmdKey = Join-Path $toolKey "command"
+    if (-not (Test-Path -LiteralPath $cmdKey)) {
+        New-Item -Path $cmdKey -Force | Out-Null
+    }
+    Set-ItemProperty -LiteralPath $cmdKey -Name "(Default)" -Value $command
+
+    $registered += "$subMenu($param)"
+}
 
 Write-Host "[+] Registered '$DisplayName' as MyTools\$Name" -ForegroundColor Green
+Write-Host "    Contexts: $($contexts -join ', ')" -ForegroundColor DarkGray
+Write-Host "    Submenus: $($registered -join ', ')" -ForegroundColor DarkGray

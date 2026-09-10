@@ -1,12 +1,16 @@
 <#
 .SYNOPSIS
-    Remove a tool from the My Tools right-click cascading menu.
+    Unregister a tool from all My Tools submenus.
+
+.DESCRIPTION
+    Removes the tool's registry entries from MyToolsMenu, MyToolsMenuFile,
+    and MyToolsMenuDrive. The tool directory and scripts are left intact.
 
 .PARAMETER Name
-    The unique tool name (registry key name under MyToolsMenu\shell).
+    The tool's unique registry key name (from tool.json "Name" field).
 
 .EXAMPLE
-    .\unregister-tool.ps1 -Name unlockfolder
+    .\unregister-tool.ps1 -Name gitsync
 #>
 
 [CmdletBinding()]
@@ -16,11 +20,20 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$toolKey = "HKCU:\Software\Classes\MyToolsMenu\shell\$Name"
 
-if (Test-Path $toolKey) {
-    Remove-Item -Path $toolKey -Recurse -Force
-    Write-Host "[+] Unregistered tool: $Name" -ForegroundColor Green
+$SubMenus = @("MyToolsMenu", "MyToolsMenuFile", "MyToolsMenuDrive")
+$removed = @()
+
+foreach ($sub in $SubMenus) {
+    $key = "HKCU:\Software\Classes\$sub\shell\$Name"
+    if (Test-Path -LiteralPath $key) {
+        Remove-Item -LiteralPath $key -Recurse -Force
+        $removed += $sub
+    }
+}
+
+if ($removed.Count -gt 0) {
+    Write-Host "[+] Unregistered '$Name' from: $($removed -join ', ')" -ForegroundColor Green
 } else {
-    Write-Host "[!] Tool not found: $Name" -ForegroundColor Yellow
+    Write-Host "[!] Tool '$Name' not found in any submenu." -ForegroundColor Yellow
 }

@@ -1,6 +1,6 @@
 # MyTools — Right-Click Context Menu Framework
 
-A dynamically extensible cascading menu for the Windows folder right-click context menu.
+A dynamically extensible cascading menu for Windows right-click context menus. Tools declare which scenarios they appear in via `tool.json`.
 
 ## Quick Start
 
@@ -8,21 +8,31 @@ A dynamically extensible cascading menu for the Windows folder right-click conte
 # Install framework and all bundled tools
 .\install-mytools.ps1
 
-# Right-click any folder -> My Tools -> Unlock Folder
+# Right-click any folder, empty space in a folder, file, drive, or desktop -> My Tools
 ```
+
+## Supported Right-Click Scenarios
+
+| Context ID | Where it appears | Path parameter | Submenu |
+|---|---|---|---|
+| `Folder` | Right-click a folder icon | `%V` | MyToolsMenu |
+| `FolderBackground` | Right-click empty space inside a folder | `%V` | MyToolsMenu |
+| `Desktop` | Right-click empty space on the desktop | `%V` | MyToolsMenu |
+| `File` | Right-click any file | `%1` | MyToolsMenuFile |
+| `Drive` | Right-click a drive in My Computer | `%1` | MyToolsMenuDrive |
 
 ## Directory Layout
 
 ```
 win\
-├── install-mytools.ps1       # Register menu + auto-register all tools
+├── install-mytools.ps1       # Register all entry points + auto-register tools
 ├── uninstall-mytools.ps1     # Remove menu ([-RemoveFiles] to delete scripts)
-├── register-tool.ps1         # Add a tool to the menu
-├── unregister-tool.ps1       # Remove a tool from the menu
+├── register-tool.ps1         # Register a tool from tool.json
+├── unregister-tool.ps1       # Remove a tool from all submenus
 ├── bin\                      # Third-party binaries (handle.exe, etc.)
 └── tools\
     └── <ToolName>\
-        ├── tool.json         # Tool manifest (required for auto-registration)
+        ├── tool.json         # Tool manifest (required)
         └── <script>.ps1      # Tool implementation
 ```
 
@@ -37,8 +47,8 @@ win\
   "Name": "mynewtool",
   "DisplayName": "Do Something",
   "Icon": "shell32.dll,5",
-  "CommandTemplate": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{ToolDir}\\MyScript.ps1\" -Path \"%1\"",
-  "AppliesTo": "Directory"
+  "CommandTemplate": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{ToolDir}\\MyScript.ps1\" -Path \"{PathParam}\"",
+  "Contexts": ["Folder", "FolderBackground", "File"]
 }
 ```
 
@@ -48,15 +58,20 @@ win\
 .\register-tool.ps1 -ToolDir .\tools\MyNewTool
 ```
 
-The `{ToolDir}` placeholder in `CommandTemplate` is replaced with the absolute
-path of the tool directory at registration time. `%1` is the selected folder path.
+### Placeholders in CommandTemplate
 
-### Register Without a Manifest
+| Placeholder | Replaced with | When |
+|---|---|---|
+| `{ToolDir}` | Absolute path of the tool directory | At registration time |
+| `{PathParam}` | `%V` (folder-type) or `%1` (item-type) | At registration time, per context |
+| `%V` | The right-clicked folder path (or current folder for background) | At runtime by Shell |
+| `%1` | The right-clicked file/drive path | At runtime by Shell |
 
-```powershell
-.\register-tool.ps1 -Name "quicktool" -DisplayName "Quick Action" `
-    -Icon "shell32.dll,0" -Command 'powershell.exe -Command "Write-Host %1"'
-```
+### Contexts Field
+
+Declare which right-click scenarios show this tool. If omitted, defaults to `["Folder", "FolderBackground", "File"]`.
+
+A tool may declare multiple contexts. It is registered in each relevant submenu with the correct path parameter automatically.
 
 ## Removing a Tool
 
@@ -73,12 +88,14 @@ path of the tool directory at registration time. `%1` is the selected folder pat
 
 ## Included Tools
 
-| Tool | Description |
-|------|-------------|
-| Unlock Folder | Find processes locking a folder via Sysinternals handle.exe; select and terminate them |
+| Tool | Contexts | Description |
+|------|----------|-------------|
+| Unlock | Folder, FolderBackground, File | Find processes locking a file/folder; terminate; fallback to delete-on-reboot |
+| Git Sync | Folder, FolderBackground, Desktop | git add -A && commit && push |
 
 ## Notes
 
 - **Per-user installation**: Uses `HKCU\Software\Classes`, no admin required.
 - **Windows 11**: The menu appears under "Show more options" (Shift+F10).
-- **handle.exe**: Auto-downloaded from Sysinternals on first use; stored in `bin\`.
+- **Folder background**: Uses `%V` to pass the current folder path. Works in File Explorer and Desktop.
+- **handle.exe**: Auto-detected in `bin\`; download from Sysinternals if missing.

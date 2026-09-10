@@ -1,0 +1,9 @@
+{
+  "Name": "gitsync",
+  "DisplayName": "Git Sync",
+  "Icon": "shell32.dll,14",
+  "CommandTemplate": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{ToolDir}\\Git-Sync.ps1\" -Path \"{PathParam}\"",
+  "Contexts": ["Folder", "FolderBackground", "Desktop"],
+  "AppliesTo": "Directory",
+  "Description": "Run git add -A && git commit -m 'sync at <timestamp>' && git push origin <branch> in the selected folder"
+}

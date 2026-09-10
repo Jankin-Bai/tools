@@ -3,7 +3,7 @@
     git add -A && git commit && git push origin main
 ```
 ``` ps
-//清除运行中的JLinkRTTViewer
+   //清除运行中的JLinkRTTViewer
     Stop-Process -Name JLinkRTTViewer -Force
 ```
 ``` cmd
