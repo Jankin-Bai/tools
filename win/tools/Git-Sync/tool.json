@@ -6,16 +6,21 @@
   "Script": "Git-Sync.ps1",
   "Contexts": ["Folder", "FolderBackground", "Desktop"],
   "AppliesTo": "Directory",
-  "Description": "Run git add -A && git commit -m 'sync at <timestamp>' && git push origin <branch> in the selected folder",
+  "Description": "Cloud-first git sync: fetch, compare local vs origin, align local to origin (reset --hard) if out of sync, then commit and push. Working directory changes are preserved via stash.",
   "Mcp": {
     "Enabled": true,
-    "Description": "Stage all changes, commit with timestamp message, and push to origin. Side effects: creates a commit and pushes to remote. Requires a git repository with an 'origin' remote.",
+    "Description": "Cloud-first git sync. Fetches origin, compares local HEAD with origin/<branch>. If in sync: commits working directory changes and pushes. If out of sync: stashes changes, resets --hard to origin, restores stash, then commits and pushes. Pass force=true to skip confirmation when out of sync. Proxy uses git's system/env default.",
     "InputSchema": {
       "type": "object",
       "properties": {
         "path": {
           "type": "string",
           "description": "Absolute path to a folder containing a git repository"
+        },
+        "force": {
+          "type": "boolean",
+          "description": "Skip confirmation and proceed with cloud-first reset --hard when local and remote are out of sync",
+          "default": false
         }
       },
       "required": ["path"]

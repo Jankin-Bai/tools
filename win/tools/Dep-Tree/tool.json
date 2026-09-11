@@ -27,11 +27,17 @@
     {"Name": "pkg-dot",      "DisplayName": "Package: DOT",           "Args": "--mode package --dot",   "AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
     {"Name": "pkg-reverse",  "DisplayName": "Package: Reverse",       "Args": "--mode package --reverse","AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
     {"Name": "pkg-png",      "DisplayName": "Package: Render PNG",    "Args": "--mode package --dot --render png", "AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
-    {"Name": "pkg-svg",      "DisplayName": "Package: Render SVG",    "Args": "--mode package --dot --render svg", "AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"}
+    {"Name": "pkg-svg",      "DisplayName": "Package: Render SVG",    "Args": "--mode package --dot --render svg", "AppliesTo": "System.FileName:requirements.txt OR System.FileName:pyproject.toml OR System.FileName:setup.cfg OR System.FileName:Pipfile OR System.FileName:setup.py"},
+    {"Name": "cg-text",      "DisplayName": "Call Graph: Text Tree",  "Args": "--mode callgraph",       "AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "cg-json",      "DisplayName": "Call Graph: JSON",       "Args": "--mode callgraph --json","AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "cg-mermaid",   "DisplayName": "Call Graph: Mermaid",    "Args": "--mode callgraph --mermaid","AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "cg-dot",       "DisplayName": "Call Graph: DOT",        "Args": "--mode callgraph --dot", "AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "cg-png",       "DisplayName": "Call Graph: Render PNG", "Args": "--mode callgraph --dot --render png", "AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"},
+    {"Name": "cg-svg",       "DisplayName": "Call Graph: Render SVG", "Args": "--mode callgraph --dot --render svg", "AppliesTo": "System.FileExtension:.py OR System.FileExtension:.pyw OR System.FileExtension:.pyi"}
   ],
   "Mcp": {
     "Enabled": true,
-    "Description": "Analyze the dependency tree of a file. Supports Makefile build dependencies, Python source import dependencies, and Python installed package dependencies. Read-only, no side effects.",
+    "Description": "Analyze the dependency tree of a file. Supports Makefile build dependencies, Python source import dependencies, Python installed package dependencies, and Python function call graphs (code2flow + pyan3 + ast). Read-only, no side effects.",
     "InputSchema": {
       "type": "object",
       "properties": {
@@ -41,7 +47,7 @@
         },
         "mode": {
           "type": "string",
-          "enum": ["auto", "makefile", "source", "package"],
+          "enum": ["auto", "makefile", "source", "package", "callgraph"],
           "default": "auto",
           "description": "Analysis mode. auto = detect by file extension"
         },
@@ -72,7 +78,21 @@
         "max_depth": {
           "type": "integer",
           "default": 10,
-          "description": "Source mode: maximum recursion depth"
+          "description": "Source/CallGraph mode: maximum recursion depth"
+        },
+        "root": {
+          "type": "string",
+          "description": "CallGraph mode: entry function name (default: auto-detect main or first function)"
+        },
+        "no_pyan3": {
+          "type": "boolean",
+          "default": false,
+          "description": "CallGraph mode: disable pyan3 backend"
+        },
+        "no_code2flow": {
+          "type": "boolean",
+          "default": false,
+          "description": "CallGraph mode: disable code2flow backend (fallback to pyan3/ast)"
         }
       },
       "required": ["path"]

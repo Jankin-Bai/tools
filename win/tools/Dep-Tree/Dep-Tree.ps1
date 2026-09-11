@@ -6,7 +6,8 @@
     Launched from "My Tools > Dep Tree" right-click context menu on a file.
     Runs dep_tree.py to parse and display the full dependency tree.
     Supports: Makefile (*.mk, *.mak), Python source (*.py, import graph via pydeps+ast),
-    Python installed packages (requirements.txt, pyproject.toml, via pipdeptree+importlib.metadata).
+    Python installed packages (requirements.txt, pyproject.toml, via pipdeptree+importlib.metadata),
+    Python function call graphs (*.py, via pyan3+ast).
     Output formats: text tree, JSON, Mermaid, Graphviz DOT, rendered PNG/SVG.
 
 .PARAMETER Path
@@ -72,11 +73,11 @@ function Main {
         throw "dep_tree.py not found"
     }
 
-    # --- Check python ---
-    $pyCheck = Invoke-Native -Command "python" -Arguments @("--version")
+    # --- Check python (use py launcher, not bare python, to avoid KiCad/other python in PATH) ---
+    $pyCheck = Invoke-Native -Command "py" -Arguments @("--version")
     if ($pyCheck.ExitCode -ne 0) {
-        $result.errors += "python.exe not found in PATH"
-        Show-Message -Text "python.exe not found in PATH." -Title "Dep Tree" -Icon Error
+        $result.errors += "py launcher not found in PATH"
+        Show-Message -Text "Python launcher (py.exe) not found in PATH." -Title "Dep Tree" -Icon Error
         throw "python not found"
     }
 
@@ -103,7 +104,7 @@ function Main {
             ForEach-Object { $_.Trim('"') }
     }
     if ($RemainingArgs) { $pyArgs += $RemainingArgs }
-    $runResult = Invoke-Native -Command "python" -Arguments $pyArgs
+    $runResult = Invoke-Native -Command "py" -Arguments $pyArgs
 
     [Console]::OutputEncoding = $oldOutputEncoding
     [Console]::InputEncoding  = $oldInputEncoding

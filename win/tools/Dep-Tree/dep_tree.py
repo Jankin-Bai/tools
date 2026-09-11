@@ -31,6 +31,7 @@ import shlex
 import logging
 import shutil
 import subprocess
+import tempfile
 import argparse
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -59,6 +60,7 @@ class NodeType(str, Enum):
     STDLIB = "stdlib"         # Python 标准库
     PKG = "pkg"               # 第三方已安装包
     C_EXT = "c_ext"           # C 扩展模块
+    FUNCTION = "function"     # 函数/方法（调用图模式）
 
     @property
     def tag(self) -> str:
@@ -76,11 +78,12 @@ class NodeType(str, Enum):
             NodeType.STDLIB: "(stdlib)",
             NodeType.PKG: "(pkg)",
             NodeType.C_EXT: "(c-ext)",
+            NodeType.FUNCTION: "(func)",
         }.get(self, "")
 
     @property
     def dot_shape(self) -> str:
-        if self in (NodeType.FILE, NodeType.SCRIPT, NodeType.PY_MODULE):
+        if self in (NodeType.FILE, NodeType.SCRIPT, NodeType.PY_MODULE, NodeType.FUNCTION):
             return "box"
         return "ellipse"
 
@@ -94,6 +97,7 @@ class NodeType(str, Enum):
             NodeType.STDLIB: "#d29922",
             NodeType.PKG: "#8957e5",
             NodeType.C_EXT: "#bf8700",
+            NodeType.FUNCTION: "#1f6feb",
         }.get(self, "#333333")
 
     @property
@@ -114,6 +118,8 @@ class NodeType(str, Enum):
             return ("[/", "/]")
         if self == NodeType.C_EXT:
             return ("[(", ")]")
+        if self == NodeType.FUNCTION:
+            return ("[/", "/]")
         return ("[", "]")
 
 
@@ -142,6 +148,15 @@ class MakefileDB:
     default_goal: str = ""
     variables: Dict[str, str] = field(default_factory=dict)
     recipes: Dict[str, List[str]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class CallGraphDB:
+    """函数调用图（caller → callees，由 pyan3 或 ast 静态分析产出）。"""
+    calls: Dict[str, List[str]] = field(default_factory=dict)
+    labels: Dict[str, str] = field(default_factory=dict)   # node_id → 显示名
+    locations: Dict[str, str] = field(default_factory=dict)  # node_id → file:line
+    entry_points: List[str] = field(default_factory=list)   # 顶层函数（非类方法）
 
 
 # ============================================================
@@ -1110,6 +1125,11 @@ class PythonSourceParser(Parser):
                     target_key = key
                     break
         if target_key is None:
+            if not dep_graph:
+                return DepNode(name=os.path.basename(path), type=NodeType.PY_MODULE,
+                               detail=path,
+                               children=[DepNode(name="(no imports found)",
+                                                 type=NodeType.EXTERNAL)])
             target_key = next(iter(dep_graph))
 
         visited: Set[str] = set()
@@ -1487,6 +1507,383 @@ class PythonPackageParser(Parser):
 
 
 # ============================================================
+# 调用图后端抽象（Strategy 模式）
+# ============================================================
+
+class CallGraphBackend(ABC):
+    """产生 CallGraphDB 的后端接口（Strategy 模式）。"""
+
+    @abstractmethod
+    def parse(self, path: str) -> Optional[CallGraphDB]:
+        """解析 Python 源文件，返回调用图；失败返回 None。"""
+
+
+# ============================================================
+# 调用图后端 1: code2flow（业界标准，调用图+流程图混合，支持纯脚本）
+# ============================================================
+
+class Code2flowBackend(CallGraphBackend):
+    """通过 code2flow 生成调用图+流程图混合视图。
+
+    code2flow 将全局代码作为 ``(global)`` 节点，因此纯脚本文件也能产出
+    有意义的调用图。节点 label 包含行号和函数签名。
+    输出 JSON 格式：graph.nodes（uid→{label,name}）+ graph.edges（source→target）。
+    """
+
+    def parse(self, path: str) -> Optional[CallGraphDB]:
+        exe = self._find_executable()
+        if not exe:
+            logger.debug("code2flow executable not found")
+            return None
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json")
+        os.close(tmp_fd)
+        try:
+            cmd = [exe, path, "--output", tmp_path, "--quiet", "--no-trimming"]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+                errors="replace",
+            )
+            if result.returncode != 0:
+                logger.warning("code2flow exited with code %d: %s",
+                               result.returncode, result.stderr.strip()[:300])
+                return None
+            if not os.path.exists(tmp_path):
+                logger.warning("code2flow produced no output file")
+                return None
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return self._parse_json(data)
+        except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired) as e:
+            logger.warning("code2flow failed: %s", e)
+            return None
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _find_executable() -> Optional[str]:
+        """定位 code2flow 可执行文件。"""
+        found = shutil.which("code2flow")
+        if found:
+            return found
+        # 从当前 Python 推导 Scripts 目录
+        scripts_dir = os.path.join(os.path.dirname(sys.executable), "Scripts")
+        candidate = os.path.join(scripts_dir, "code2flow.exe")
+        if os.path.exists(candidate):
+            return candidate
+        return None
+
+    @staticmethod
+    def _parse_json(data: dict) -> Optional[CallGraphDB]:
+        graph = data.get("graph", {})
+        nodes = graph.get("nodes", {})
+        edges = graph.get("edges", [])
+        if not nodes:
+            return None
+
+        db = CallGraphDB()
+
+        for uid, node in nodes.items():
+            name = node.get("name", "")      # e.g. "dep_tree::main" / "dep_tree::(global)"
+            label = node.get("label", "")    # e.g. "1879: main()"
+
+            # 显示名：取最后一个 :: 之后的部分
+            parts = name.split("::")
+            display = parts[-1] if parts else name
+            if display == "(global)":
+                display = "(global script)"
+
+            db.labels[uid] = display
+
+            # 从 label 提取行号："1879: main()" → "line 1879"
+            loc_m = re.match(r"(\d+):", label)
+            if loc_m:
+                db.locations[uid] = "line %s" % loc_m.group(1)
+
+            # 入口点：全局代码 或 顶层函数（name 中只有一个 ::）
+            if "(global)" in name or name.count("::") == 1:
+                if uid not in db.entry_points:
+                    db.entry_points.append(uid)
+
+        for edge in edges:
+            source = edge.get("source")
+            target = edge.get("target")
+            if source in db.labels and target in db.labels:
+                db.calls.setdefault(source, []).append(target)
+
+        if not db.calls and not db.labels:
+            return None
+        return db
+
+
+# ============================================================
+# 调用图后端 2: pyan3（业界标准静态调用图分析）
+# ============================================================
+
+class Pyan3Backend(CallGraphBackend):
+    """通过 pyan3 静态分析获取函数调用图。
+
+    调用 `pyan3 --dot --no-defines`，解析 DOT 输出中的节点（tooltip 含类型信息）
+    和调用边。只保留函数/方法节点，过滤类、模块、属性节点。
+    """
+
+    def parse(self, path: str) -> Optional[CallGraphDB]:
+        python_exe = resolve_python_exe(None, path)
+        cmd = [python_exe, "-m", "pyan", path, "--dot", "--no-defines"]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+                errors="replace",
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.warning("pyan3 execution failed: %s", e)
+            return None
+
+        if result.returncode != 0:
+            logger.warning("pyan3 exited with code %d: %s",
+                           result.returncode, result.stderr.strip()[:300])
+            return None
+
+        return self._parse_dot(result.stdout)
+
+    @staticmethod
+    def _parse_dot(dot_text: str) -> Optional[CallGraphDB]:
+        """解析 pyan3 DOT 输出，提取函数/方法节点和调用边。"""
+        db = CallGraphDB()
+
+        # 节点行: "node_id" [label="...", tooltip="full.name\nfile:line\ntype info"];
+        node_re = re.compile(r'"([^"]+)"\s*\[([^\]]*)\];')
+        for m in node_re.finditer(dot_text):
+            node_id = m.group(1)
+            attrs = m.group(2)
+            tooltip_m = re.search(r'tooltip="([^"]*)"', attrs)
+            label_m = re.search(r'label="([^"]*)"', attrs)
+            label = label_m.group(1) if label_m else node_id
+
+            if not tooltip_m:
+                continue
+            tooltip = tooltip_m.group(1)
+            parts = tooltip.split("\\n")
+            location = parts[1] if len(parts) > 1 else ""
+            type_info = parts[2] if len(parts) > 2 else ""
+
+            # 只保留函数和方法（tooltip 最后一行含 "function in" 或 "method in"）
+            if "function in" in type_info:
+                db.labels[node_id] = label
+                db.locations[node_id] = location
+                db.entry_points.append(node_id)
+            elif "method in" in type_info:
+                db.labels[node_id] = label
+                db.locations[node_id] = location
+
+        # 边行: "caller" -> "callee" [style="solid", color="#000000"];
+        edge_re = re.compile(r'"([^"]+)"\s*->\s*"([^"]+)"')
+        for m in edge_re.finditer(dot_text):
+            caller, callee = m.group(1), m.group(2)
+            # 只保留函数/方法之间的调用边
+            if caller in db.labels and callee in db.labels:
+                db.calls.setdefault(caller, []).append(callee)
+
+        if not db.calls and not db.labels:
+            return None
+        return db
+
+
+# ============================================================
+# 调用图后端 3: 纯 ast 静态分析（fallback，功能有限）
+# ============================================================
+
+class AstCallGraphBackend(CallGraphBackend):
+    """纯 ast 静态分析 fallback。只处理直接函数调用和 self.method()。"""
+
+    def parse(self, path: str) -> Optional[CallGraphDB]:
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                tree = ast.parse(f.read(), filename=path)
+        except (SyntaxError, IOError, OSError) as e:
+            logger.warning("ast parse failed: %s", e)
+            return None
+
+        db = CallGraphDB()
+        module_name = os.path.splitext(os.path.basename(path))[0]
+
+        # 建立 parent 引用
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                child.parent = node  # type: ignore[attr-defined]
+
+        # 收集所有函数定义（顶层函数和类方法）
+        functions: Dict[str, ast.FunctionDef] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                parts = [node.name]
+                parent = getattr(node, "parent", None)
+                while parent is not None:
+                    if isinstance(parent, ast.ClassDef):
+                        parts.insert(0, parent.name)
+                    elif isinstance(parent, ast.Module):
+                        break
+                    parent = getattr(parent, "parent", None)
+                full_name = ".".join(parts)
+                node_id = "%s__%s" % (module_name, full_name.replace(".", "__"))
+                functions[node_id] = node
+                db.labels[node_id] = full_name
+                db.locations[node_id] = "%s:%d" % (path, node.lineno)
+                if len(parts) == 1:
+                    db.entry_points.append(node_id)
+
+        # 分析每个函数体内的调用
+        for node_id, func_node in functions.items():
+            callees: List[str] = []
+            for call in ast.walk(func_node):
+                if not isinstance(call, ast.Call):
+                    continue
+                callee_name = self._resolve_call_name(call, functions, module_name)
+                if callee_name and callee_name in functions and callee_name != node_id:
+                    callees.append(callee_name)
+            if callees:
+                db.calls[node_id] = list(dict.fromkeys(callees))
+
+        if not db.calls and not db.labels:
+            return None
+        return db
+
+    @staticmethod
+    def _resolve_call_name(call: ast.Call, functions: Dict[str, ast.FunctionDef],
+                           module_name: str) -> Optional[str]:
+        """从 ast.Call 节点解析被调用函数的限定名。"""
+        func = call.func
+        if isinstance(func, ast.Name):
+            candidate = "%s__%s" % (module_name, func.id)
+            if candidate in functions:
+                return candidate
+            return None
+        if isinstance(func, ast.Attribute):
+            method_name = func.attr
+            for fid in functions:
+                if fid.endswith("__" + method_name):
+                    return fid
+            return None
+        return None
+
+
+# ============================================================
+# 调用图构建器：从 CallGraphDB 展开为 DepNode 树
+# ============================================================
+
+class CallGraphBuilder:
+    """从 CallGraphDB 递归构建 DepNode 树（从入口函数展开调用链）。"""
+
+    def __init__(self, db: CallGraphDB, max_depth: int = 10) -> None:
+        self.db = db
+        self.max_depth = max_depth
+
+    def build(self, entry: str) -> DepNode:
+        return self._build(entry, set(), set(), 0)
+
+    def _build(self, node_id: str, seen: Set[str], expanded: Set[str],
+               depth: int) -> DepNode:
+        label = self.db.labels.get(node_id, node_id)
+        location = self.db.locations.get(node_id, "")
+
+        if node_id in seen:
+            return DepNode(name=label, type=NodeType.CIRCULAR,
+                           detail="%s (循环调用)" % location)
+        if node_id in expanded or depth >= self.max_depth:
+            return DepNode(name=label, type=NodeType.REF,
+                           detail="%s (见上方)" % location)
+
+        node = DepNode(name=label, type=NodeType.FUNCTION, detail=location)
+        seen = seen | {node_id}
+        expanded.add(node_id)
+
+        for callee in self.db.calls.get(node_id, []):
+            node.children.append(self._build(callee, seen, expanded, depth + 1))
+
+        return node
+
+
+# ============================================================
+# 调用图解析器（Facade：后端策略链 + 构建图）
+# ============================================================
+
+@register_parser
+class CallGraphParser(Parser):
+    """Python 函数调用图解析器。
+
+    Facade：按顺序尝试 backends 列表，第一个成功的使用。
+    不注册扩展名（extensions=[]），通过 --mode callgraph 显式选择。
+    """
+
+    extensions: List[str] = []
+
+    def __init__(self, backends: List[CallGraphBackend], max_depth: int = 10) -> None:
+        self.backends = backends
+        self.max_depth = max_depth
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "CallGraphParser":
+        backends: List[CallGraphBackend] = []
+        if not getattr(args, "no_code2flow", False):
+            backends.append(Code2flowBackend())
+        if not getattr(args, "no_pyan3", False):
+            backends.append(Pyan3Backend())
+        backends.append(AstCallGraphBackend())
+        return cls(backends=backends, max_depth=args.max_depth)
+
+    @property
+    def mode_label(self) -> str:
+        return "Call Graph Mode"
+
+    def parse(self, path: str, root: Optional[str] = None) -> DepNode:
+        abs_path = os.path.abspath(path)
+
+        # 策略链：按顺序尝试后端
+        db: Optional[CallGraphDB] = None
+        for backend in self.backends:
+            db = backend.parse(abs_path)
+            if db is not None:
+                logger.debug("Using call graph backend: %s", type(backend).__name__)
+                break
+
+        if db is None:
+            logger.warning("All call graph backends failed, using empty graph")
+            db = CallGraphDB()
+
+        # 确定入口函数
+        entry = root
+        if entry is None:
+            for ep in db.entry_points:
+                if db.labels.get(ep, "").lower() == "main":
+                    entry = ep
+                    break
+            if entry is None and db.entry_points:
+                entry = db.entry_points[0]
+            if entry is None and db.labels:
+                entry = next(iter(db.labels))
+
+        if entry is None:
+            agg = DepNode(name=os.path.basename(path), type=NodeType.PY_MODULE,
+                          detail=abs_path)
+            agg.children = [DepNode(name="(no functions found)",
+                                    type=NodeType.EXTERNAL)]
+            return agg
+
+        builder = CallGraphBuilder(db, max_depth=self.max_depth)
+        tree = builder.build(entry)
+
+        agg = DepNode(name=os.path.basename(path), type=NodeType.PY_MODULE,
+                      detail=abs_path)
+        agg.children = [tree]
+        return agg
+
+
+# ============================================================
 # 渲染器（Strategy 模式：Renderer 抽象 + 具体实现）
 # ============================================================
 
@@ -1602,7 +1999,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--root", help="从指定目标开始展开（默认用 Makefile 的 default goal）")
     ap.add_argument("--dirty", action="store_true", help="标记需要重建的节点（运行 make -nd 检测）")
     # Python 模式新增参数
-    ap.add_argument("--mode", choices=["auto", "makefile", "source", "package"],
+    ap.add_argument("--mode", choices=["auto", "makefile", "source", "package", "callgraph"],
                     default="auto", help="解析模式（默认 auto: 按文件扩展名自动推断）")
     ap.add_argument("--name", help="包模式: 指定要分析的包名（不指定则分析全部）")
     ap.add_argument("--python", help="指定 Python 可执行文件路径（默认自动检测项目 venv）")
@@ -1612,6 +2009,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--no-pydeps", action="store_true", help="源码模式: 禁用 pydeps，强制 ast fallback")
     ap.add_argument("--no-pipdeptree", action="store_true",
                     help="包模式: 禁用 pipdeptree，强制 importlib.metadata fallback")
+    ap.add_argument("--no-pyan3", action="store_true",
+                    help="调用图模式: 禁用 pyan3，强制 ast fallback")
+    ap.add_argument("--no-code2flow", action="store_true",
+                    help="调用图模式: 禁用 code2flow 后端")
     ap.add_argument("--render", choices=["png", "svg"], default=None,
                     help="渲染 DOT 为图片（需 graphviz dot），输出到同目录下")
     ap.add_argument("-v", "--verbose", action="store_true", help="详细日志")
@@ -1646,6 +2047,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser_cls = PythonSourceParser
     elif args.mode == "package":
         parser_cls = PythonPackageParser
+    elif args.mode == "callgraph":
+        parser_cls = CallGraphParser
     else:
         parser_cls = registry.find(path)
         if parser_cls is None:
