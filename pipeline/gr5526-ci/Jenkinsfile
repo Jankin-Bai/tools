@@ -1,41 +1,59 @@
 // ============================================================================
 // gr5526-ci : GR5526 compile -> flash -> test closed loop
 // ============================================================================
+//
+// ARCHITECTURE
+//
+//   Jenkins SCM
+//       |
+//       +-- Jenkinsfile
+//       +-- CI tools
+//       |
+//       v
+//   GR5526 Hardware Agent
+//       |
+//       +-- Local Bootloader project
+//       +-- Local APP project
+//       +-- GR5xxx_console
+//       +-- J-Link
+//       +-- DUT
+//
+// Firmware source code is NOT stored in SCM.
+// Firmware projects are selected at build time through:
+//   BL_PROJECT_PATH
+//   APP_PROJECT_PATH
+//
 // HARD RULES (MANDATORY - never change):
-//   - GR5xxx_console for ALL flash ops (erase/program/dump/reset). NO J-Link flash/reset.
-//   - Flash order: App FIRST, Bootloader LAST (SCA final -> Bootloader).
-//   - Erase only: BL region, Bank A, Bank B. NVDS (0x002EF000) PRESERVED. NO eraseall.
-//   - All addresses from detect_firmware_layout.py (no hardcoding in production).
+//   - GR5xxx_console for ALL flash ops (erase/program/dump/reset).
+//   - NO J-Link flash/reset.
+//   - Flash order: App FIRST, Bootloader LAST.
+//   - Erase only: BL region, Bank A, Bank B.
+//   - NVDS (0x002EF000) MUST be preserved.
+//   - NO eraseall.
+//   - Production addresses come from detect_firmware_layout.py.
 //   - DRY_RUN defaults true.
 //   - Pure ASCII output.
 //
-// FUTURE EXTENSION NOTES (P2):
-//   - Shared Library: When a second project (STM32/ESP32) appears, extract
-//     embeddedBuild/embeddedFlash/hardwareTest/publishResult into a Jenkins
-//     Shared Library. Do NOT abstract hardware-specific order (App-first/BL-last)
-//     away into generics - those are hardware safety rules, not code style.
-//
-//   - Hardware Resource Lock: Agent + DUT + J-Link + GR5xxx_console = one
-//     non-concurrent resource. disableConcurrentBuilds() prevents parallel builds
-//     on this agent. Future: use lockable-resources plugin for multi-agent
-//     orchestration (e.g. gr5526-hw-01, gr5526-hw-02 sharing the same J-Link).
-//
-//   - Multi-agent expansion: agent label 'gr5526-hw' can be expanded to
-//     'gr5526-hw-01', 'stm32-hw-01', etc. CHIP env var is already parameterized.
-//     New chip families get their own label and tools/ scripts.
-//
-//   - AI/n8n consumption: Post stage generates artifacts/test_result.json
-//     (format defined in ci/result_schema.json). This JSON can be POSTed to
-//     an n8n webhook for Dashboard/AI consumption. Webhook call is NOT
-//     implemented in this pipeline (out of scope) - only the data format is
-//     standardized.
 // ============================================================================
 
-// GR5xxx_console wrapper (defined OUTSIDE pipeline block as a global Groovy function).
-// Centralizes: log prefix, DRY_RUN mode, error propagation.
-// Flash main flow stays readable - callers see explicit App-first/BL-last order.
+
+// ============================================================================
+// GR5xxx_console wrapper
+// ============================================================================
+//
+// All GR5xxx_console operations go through this function.
+//
+// This keeps the hardware flow readable while enforcing:
+//   1. DRY_RUN
+//   2. GR5xxx_console usage
+//   3. common logging
+//
 def grConsole(String args) {
-    def dryRun = (env.DRY_RUN == 'true' || env.DRY_RUN == 'True' || env.DRY_RUN == null)
+    def dryRun =
+        (env.DRY_RUN == 'true' ||
+         env.DRY_RUN == 'True' ||
+         env.DRY_RUN == null)
+
     if (dryRun) {
         echo "[DRY-RUN] GR5xxx_console: ${args}"
     } else {
@@ -44,567 +62,1815 @@ def grConsole(String args) {
     }
 }
 
+
 pipeline {
-  agent { label 'gr5526-hw' }
-  options {
-    buildDiscarder(logRotator(numToKeepStr: '30'))
-    timeout(time: 30, unit: 'MINUTES')
-    // Hardware Resource Lock: this agent owns one DUT + J-Link + GR5xxx_console.
-    // disableConcurrentBuilds() prevents two builds from fighting over the same
-    // hardware. For multi-agent, use lockable-resources plugin instead.
-    disableConcurrentBuilds()
-  }
-  parameters {
-    booleanParam(name: 'DRY_RUN', defaultValue: true, description: 'true = print only, no hardware action')
-    booleanParam(name: 'SKIP_BUILD', defaultValue: false, description: 'Skip Stage 2 build')
-    booleanParam(name: 'SKIP_FLASH', defaultValue: false, description: 'Skip Stage 4 flash')
-    // P0-3: Allow prebuilt firmware ONLY when explicitly enabled. Default = STOP on build failure.
-    booleanParam(name: 'ALLOW_PREBUILT_FIRMWARE', defaultValue: false, description: 'Allow using existing firmware when build fails. WARNING: firmware was NOT produced by current build.')
-    // P0-5: Allow layout fallback ONLY in development. Default = FAIL on detection error.
-    booleanParam(name: 'ALLOW_LAYOUT_FALLBACK', defaultValue: false, description: 'Development only. Never enable in production CI. Uses hardcoded layout when detection fails.')
-    string(name: 'BL_KEYWORD', defaultValue: '', description: 'BL RTT success keyword (empty=any output)')
-    string(name: 'APP_KEYWORD', defaultValue: '', description: 'APP RTT success keyword (empty=any output)')
-  }
-  environment {
-    W4          = 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4'
-    GR_CONSOLE  = 'D:\\Program Files (x86)\\Goodix\\GProgrammer\\GR5xxx_console.exe'
-    CHIP        = 'GR5526'
-    BL_SDK      = 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\GR5526.SDK-1.0.3'
-    APP_SDK     = 'D:/Users/Administrator/Documents/code/wingcard_cli/GR5526_SDK_V1.0.4'
-    BL_GCC      = 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\wc2\\bootloader\\GCC'
-    APP_GCC     = 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\wc2\\app\\GCC'
-    VENV_PY     = 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\.venv\\Scripts\\python.exe'
-    TOOLS       = 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\tools'
-    CI_DIR      = 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\ci'
-    ARTIFACTS   = 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\artifacts'
-    // NVDS is a HARDWARE CONSTANT (fixed by GR5526 SDK, last flash sector).
-    // It is NOT a layout detection result - it is safe to hardcode.
-    NVDS_ADDR   = '0x002EF000'
-    // NOTE (P0-5): BL_ADDR / BL_END / APP_ADDR / APP_END / BANK_B_ADDR / BANK_B_END
-    // are NOT hardcoded here. They come from detect_firmware_layout.py at runtime.
-    // If detection fails and ALLOW_LAYOUT_FALLBACK=true, the Jenkinsfile sets
-    // dev defaults (clearly WARNING). If false, pipeline STOPS.
-  }
-
-  stages {
 
     // ========================================================================
-    // Stage 1: Prepare Environment (SERIAL - was parallel, fixed .venv race)
+    // Hardware Agent
     // ========================================================================
-    stage('1. Prepare Environment') {
-      stages {
-        stage('1.1 Environment Check') {
-          steps {
-            echo '[Stage1.1] Starting environment verification'
-            echo "DRY_RUN=${params.DRY_RUN} SKIP_BUILD=${params.SKIP_BUILD} SKIP_FLASH=${params.SKIP_FLASH}"
-            echo "ALLOW_PREBUILT_FIRMWARE=${params.ALLOW_PREBUILT_FIRMWARE} ALLOW_LAYOUT_FALLBACK=${params.ALLOW_LAYOUT_FALLBACK}"
 
-            script {
-              // J-Link auto-detection (no hardcoding of serial/path)
-              echo '>> J-Link auto-detection'
-              def detectOut = bat(returnStdout: true, script: '@"%VENV_PY%" "%TOOLS%\\jlink_detect.py"').trim()
-              detectOut.split('\n').each { line ->
-                def parts = line.split('=', 2)
-                if (parts.length == 2) {
-                  def key = parts[0].trim()
-                  def val = parts[1].trim()
-                  if (key == 'JLINK_PATH') env.JLINK_PATH = val
-                  else if (key == 'JLINK_SERIAL') env.JLINK_SERIAL = val
-                  else if (key == 'JLINK_IDX') env.JLINK_IDX = val
-                  else if (key == 'JLINK_USB_ID') env.JLINK_USB_ID = val
-                }
-              }
-              if (!env.JLINK_PATH || !env.JLINK_IDX) {
-                error('J-Link auto-detection FAILED - check USB connection and software')
-              }
-              echo "J-Link: path=${env.JLINK_PATH} idx=${env.JLINK_IDX} serial=${env.JLINK_SERIAL}"
-            }
-
-            // Tool existence checks
-            bat '@if not exist "%GR_CONSOLE%" (echo ERROR: GR5xxx_console missing & exit /b 1)'
-            bat '@where arm-none-eabi-gcc >nul 2>&1 || (echo ERROR: arm-none-eabi-gcc not in PATH & exit /b 1)'
-            bat '@where mingw32-make >nul 2>&1 || (echo ERROR: mingw32-make not in PATH & exit /b 1)'
-
-            // Source directory checks
-            bat '@if not exist "%BL_GCC%\\Makefile" (echo ERROR: bootloader Makefile missing & exit /b 1)'
-            bat '@if not exist "%APP_GCC%\\Makefile" (echo ERROR: app Makefile missing & exit /b 1)'
-            bat '@if not exist "%BL_SDK%" (echo ERROR: bootloader SDK missing & exit /b 1)'
-            bat '@if not exist "%APP_SDK%" (echo ERROR: app SDK missing & exit /b 1)'
-
-            // Tool scripts (existing)
-            bat '@if not exist "%TOOLS%\\detect_firmware_layout.py" (echo ERROR: detect_firmware_layout.py missing & exit /b 1)'
-            bat '@if not exist "%TOOLS%\\generate_image_info.py" (echo ERROR: generate_image_info.py missing & exit /b 1)'
-            bat '@if not exist "%TOOLS%\\test_rtt_with_jump.py" (echo ERROR: test_rtt_with_jump.py missing & exit /b 1)'
-            // Tool scripts (new in this refactor)
-            bat '@if not exist "%TOOLS%\\verify_flash.py" (echo ERROR: verify_flash.py missing & exit /b 1)'
-            bat '@if not exist "%TOOLS%\\firmware_metadata.py" (echo ERROR: firmware_metadata.py missing & exit /b 1)'
-            bat '@if not exist "%CI_DIR%\\flash_plan.py" (echo ERROR: ci/flash_plan.py missing & exit /b 1)'
-
-            echo '[PASS] env-check: all tools and sources verified'
-          }
-        }
-
-        stage('1.2 Python Venv Setup') {
-          steps {
-            echo '[Stage1.2] Setting up Python virtual environment (SERIAL after env-check)'
-            script {
-              if (params.DRY_RUN.toBoolean()) {
-                echo '[DRY-RUN] would create/activate venv and install requirements'
-              } else {
-                bat '''@echo off
-cd /d "%W4%"
-if not exist ".venv\\Scripts\\python.exe" (
-    echo [venv] Creating virtual environment...
-    python -m venv .venv
-) else (
-    echo [venv] Reusing existing virtual environment
-)
-echo [venv] Installing dependencies...
-".venv\\Scripts\\python.exe" -m pip install --quiet -r requirements.txt
-echo [venv] Setup complete
-".venv\\Scripts\\python.exe" --version'''
-              }
-            }
-            echo '[PASS] venv-setup complete'
-          }
-        }
-      }
+    agent {
+        label 'gr5526-hw'
     }
 
-    // ========================================================================
-    // Stage 2: Build bootloader + APP (parallel)
-    // ========================================================================
-    stage('2. Build') {
-      when { expression { return !params.SKIP_BUILD.toBoolean() } }
-      parallel {
-        stage('2.1 Build Bootloader') {
-          steps {
-            echo '[Stage2.1] Compiling GR5526 bootloader (SDK 1.0.3)'
-            script {
-              if (params.DRY_RUN.toBoolean()) {
-                echo '[DRY-RUN] would: cd BL_GCC && mingw32-make clean && mingw32-make'
-                echo '[DRY-RUN] would: generate_image_info.py -> bl_fw.bin'
-                env.BL_BUILD_STATUS = 'dry-run'
-              } else {
-                // Clean and build bootloader
-                bat '''@echo off
-cd /d "%BL_GCC%"
-echo [build-boot] Cleaning...
-mingw32-make clean 2>&1
-echo [build-boot] Compiling...
-mingw32-make 2>&1
-if errorlevel 1 (
-    echo [FAIL] bootloader make failed
-    exit /b 1
-)
-if not exist "out\\app_bootloader.bin" (
-    echo [FAIL] app_bootloader.bin not produced
-    exit /b 1
-)
-echo [PASS] bootloader compiled: out\\app_bootloader.bin'''
 
-                // Generate Image Info -> bl_fw.bin (use GR5xxx_console generate for correct format)
-                echo '[build-boot] Generating bl_fw.bin with Image Info via GR5xxx_console'
-                grConsole("generate \"${env.BL_GCC}\\out\\app_bootloader.bin\" \"${env.W4}\\bl_fw.bin\" 0x00200000 1024 1")
-                env.BL_BUILD_STATUS = 'success'
-                echo '[PASS] build-boot: bl_fw.bin generated'
-              }
+    // ========================================================================
+    // Jenkins Options
+    // ========================================================================
+
+    options {
+
+        buildDiscarder(
+            logRotator(
+                numToKeepStr: '30'
+            )
+        )
+
+        timeout(
+            time: 30,
+            unit: 'MINUTES'
+        )
+
+        // One Hardware Agent owns:
+        //   DUT + J-Link + GR5xxx_console
+        //
+        // Do not allow two builds to operate on the same hardware.
+        disableConcurrentBuilds()
+    }
+
+
+    // ========================================================================
+    // Build Parameters
+    // ========================================================================
+
+    parameters {
+
+        // --------------------------------------------------------------------
+        // Execution control
+        // --------------------------------------------------------------------
+
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: true,
+            description: 'true = print commands only, no hardware action'
+        )
+
+        booleanParam(
+            name: 'SKIP_BUILD',
+            defaultValue: false,
+            description: 'Skip firmware build stage'
+        )
+
+        booleanParam(
+            name: 'SKIP_FLASH',
+            defaultValue: false,
+            description: 'Skip hardware flash stage'
+        )
+
+
+        // --------------------------------------------------------------------
+        // Safety switches
+        // --------------------------------------------------------------------
+
+        booleanParam(
+            name: 'ALLOW_PREBUILT_FIRMWARE',
+            defaultValue: false,
+            description: 'Allow existing firmware when build fails. WARNING: firmware was NOT produced by current build.'
+        )
+
+        booleanParam(
+            name: 'ALLOW_LAYOUT_FALLBACK',
+            defaultValue: false,
+            description: 'Development only. Use hardcoded layout if detection fails. NEVER enable for production CI.'
+        )
+
+
+        // --------------------------------------------------------------------
+        // Firmware project selection
+        // --------------------------------------------------------------------
+        //
+        // IMPORTANT:
+        //
+        // Firmware source is NOT stored in SCM.
+        //
+        // Select the local build directory on the Hardware Agent.
+        //
+        // The selected directory MUST contain Makefile.
+        //
+        // Therefore:
+        //
+        //     Project Path
+        //          |
+        //          +-- Makefile
+        //          +-- source
+        //          +-- include
+        //          +-- ...
+        //
+        // Source + Makefile stay together.
+        //
+
+        string(
+            name: 'BL_PROJECT_PATH',
+            defaultValue: 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\wc2\\bootloader\\GCC',
+            description: 'Local Bootloader build directory containing Makefile'
+        )
+
+        string(
+            name: 'APP_PROJECT_PATH',
+            defaultValue: 'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\wc2\\app\\GCC',
+            description: 'Local APP build directory containing Makefile'
+        )
+
+
+        // --------------------------------------------------------------------
+        // RTT test configuration
+        // --------------------------------------------------------------------
+
+        string(
+            name: 'BL_KEYWORD',
+            defaultValue: '',
+            description: 'BL RTT success keyword. Empty = any output.'
+        )
+
+        string(
+            name: 'APP_KEYWORD',
+            defaultValue: '',
+            description: 'APP RTT success keyword. Empty = any output.'
+        )
+    }
+
+
+    // ========================================================================
+    // Global Environment
+    // ========================================================================
+
+    environment {
+
+        // --------------------------------------------------------------------
+        // Local CI root
+        // --------------------------------------------------------------------
+
+        W4 =
+            'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4'
+
+
+        // --------------------------------------------------------------------
+        // Hardware tools
+        // --------------------------------------------------------------------
+
+        GR_CONSOLE =
+            'D:\\Program Files (x86)\\Goodix\\GProgrammer\\GR5xxx_console.exe'
+
+        CHIP = 'GR5526'
+
+
+        // --------------------------------------------------------------------
+        // SDK
+        // --------------------------------------------------------------------
+
+        BL_SDK =
+            'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\GR5526.SDK-1.0.3'
+
+        APP_SDK =
+            'D:/Users/Administrator/Documents/code/wingcard_cli/GR5526_SDK_V1.0.4'
+
+
+        // --------------------------------------------------------------------
+        // Firmware projects
+        // --------------------------------------------------------------------
+        //
+        // These are selected by Jenkins build parameters.
+        //
+        BL_GCC / APP_GCC are NOT hardcoded firmware paths anymore.
+        //
+
+        BL_GCC = "${params.BL_PROJECT_PATH}"
+
+        APP_GCC = "${params.APP_PROJECT_PATH}"
+
+
+        // --------------------------------------------------------------------
+        // Python / CI tools
+        // --------------------------------------------------------------------
+
+        VENV_PY =
+            'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\.venv\\Scripts\\python.exe'
+
+        TOOLS =
+            'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\tools'
+
+        CI_DIR =
+            'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\ci'
+
+        ARTIFACTS =
+            'D:\\Users\\Administrator\\Documents\\code\\wingcard_cli\\w4\\artifacts'
+
+
+        // --------------------------------------------------------------------
+        // Hardware constant
+        // --------------------------------------------------------------------
+        //
+        // NVDS is fixed by GR5526 SDK / hardware layout.
+        //
+        // It is NOT a runtime firmware layout result.
+        //
+        // NEVER erase this region.
+        //
+
+        NVDS_ADDR = '0x002EF000'
+    }
+
+
+    // ========================================================================
+    // Pipeline Stages
+    // ========================================================================
+
+    stages {
+
+
+        // ====================================================================
+        // Stage 1
+        // Prepare Environment
+        // ====================================================================
+
+        stage('1. Prepare Environment') {
+
+            stages {
+
+
+                // ============================================================
+                // 1.1 Environment Check
+                // ============================================================
+
+                stage('1.1 Environment Check') {
+
+                    steps {
+
+                        echo '[Stage1.1] Starting environment verification'
+
+                        echo "DRY_RUN=${params.DRY_RUN}"
+                        echo "SKIP_BUILD=${params.SKIP_BUILD}"
+                        echo "SKIP_FLASH=${params.SKIP_FLASH}"
+
+                        echo "ALLOW_PREBUILT_FIRMWARE=${params.ALLOW_PREBUILT_FIRMWARE}"
+                        echo "ALLOW_LAYOUT_FALLBACK=${params.ALLOW_LAYOUT_FALLBACK}"
+
+
+                        script {
+
+                            // ------------------------------------------------
+                            // Resolve firmware projects
+                            // ------------------------------------------------
+
+                            env.BL_GCC =
+                                params.BL_PROJECT_PATH.trim()
+
+                            env.APP_GCC =
+                                params.APP_PROJECT_PATH.trim()
+
+
+                            if (!env.BL_GCC || !env.APP_GCC) {
+
+                                error(
+                                    'BL_PROJECT_PATH and APP_PROJECT_PATH are required'
+                                )
+                            }
+
+
+                            echo "Bootloader project:"
+                            echo "  ${env.BL_GCC}"
+
+                            echo "APP project:"
+                            echo "  ${env.APP_GCC}"
+
+
+                            // ------------------------------------------------
+                            // J-Link auto detection
+                            // ------------------------------------------------
+
+                            echo '>> J-Link auto-detection'
+
+                            def detectOut = bat(
+                                returnStdout: true,
+                                script:
+                                    '@"%VENV_PY%" "%TOOLS%\\jlink_detect.py"'
+                            ).trim()
+
+
+                            detectOut.split('\n').each { line ->
+
+                                def parts =
+                                    line.split('=', 2)
+
+                                if (parts.length == 2) {
+
+                                    def key =
+                                        parts[0].trim()
+
+                                    def val =
+                                        parts[1].trim()
+
+
+                                    if (key == 'JLINK_PATH') {
+
+                                        env.JLINK_PATH = val
+
+                                    } else if (key == 'JLINK_SERIAL') {
+
+                                        env.JLINK_SERIAL = val
+
+                                    } else if (key == 'JLINK_IDX') {
+
+                                        env.JLINK_IDX = val
+
+                                    } else if (key == 'JLINK_USB_ID') {
+
+                                        env.JLINK_USB_ID = val
+                                    }
+                                }
+                            }
+
+
+                            if (!env.JLINK_PATH || !env.JLINK_IDX) {
+
+                                error(
+                                    'J-Link auto-detection FAILED - check USB connection and software'
+                                )
+                            }
+
+
+                            echo "J-Link:"
+                            echo "  path=${env.JLINK_PATH}"
+                            echo "  idx=${env.JLINK_IDX}"
+                            echo "  serial=${env.JLINK_SERIAL}"
+                        }
+
+
+                        // ----------------------------------------------------
+                        // Hardware / tool checks
+                        // ----------------------------------------------------
+
+                        bat '''
+@if not exist "%GR_CONSOLE%" (
+    echo ERROR: GR5xxx_console missing
+    exit /b 1
+)
+'''
+
+
+                        bat '''
+@where arm-none-eabi-gcc >nul 2>&1 || (
+    echo ERROR: arm-none-eabi-gcc not in PATH
+    exit /b 1
+)
+'''
+
+
+                        bat '''
+@where mingw32-make >nul 2>&1 || (
+    echo ERROR: mingw32-make not in PATH
+    exit /b 1
+)
+'''
+
+
+                        // ----------------------------------------------------
+                        // Firmware project checks
+                        // ----------------------------------------------------
+                        //
+                        // The project directory is selected at build time.
+                        // It MUST contain Makefile.
+                        //
+
+                        bat '''
+@if not exist "%BL_GCC%" (
+    echo ERROR: bootloader project directory missing
+    exit /b 1
+)
+
+@if not exist "%BL_GCC%\\Makefile" (
+    echo ERROR: bootloader Makefile missing
+    exit /b 1
+)
+
+@if not exist "%APP_GCC%" (
+    echo ERROR: app project directory missing
+    exit /b 1
+)
+
+@if not exist "%APP_GCC%\\Makefile" (
+    echo ERROR: app Makefile missing
+    exit /b 1
+)
+'''
+
+
+                        // ----------------------------------------------------
+                        // SDK checks
+                        // ----------------------------------------------------
+
+                        bat '''
+@if not exist "%BL_SDK%" (
+    echo ERROR: bootloader SDK missing
+    exit /b 1
+)
+
+@if not exist "%APP_SDK%" (
+    echo ERROR: app SDK missing
+    exit /b 1
+)
+'''
+
+
+                        // ----------------------------------------------------
+                        // CI tools
+                        // ----------------------------------------------------
+
+                        bat '''
+@if not exist "%TOOLS%\\detect_firmware_layout.py" (
+    echo ERROR: detect_firmware_layout.py missing
+    exit /b 1
+)
+
+@if not exist "%TOOLS%\\generate_image_info.py" (
+    echo ERROR: generate_image_info.py missing
+    exit /b 1
+)
+
+@if not exist "%TOOLS%\\test_rtt_with_jump.py" (
+    echo ERROR: test_rtt_with_jump.py missing
+    exit /b 1
+)
+
+@if not exist "%TOOLS%\\verify_flash.py" (
+    echo ERROR: verify_flash.py missing
+    exit /b 1
+)
+
+@if not exist "%TOOLS%\\firmware_metadata.py" (
+    echo ERROR: firmware_metadata.py missing
+    exit /b 1
+)
+
+@if not exist "%CI_DIR%\\flash_plan.py" (
+    echo ERROR: ci/flash_plan.py missing
+    exit /b 1
+)
+'''
+
+
+                        echo '[PASS] env-check: all tools and firmware projects verified'
+                    }
+                }
+
+
+                // ============================================================
+                // 1.2 Python Venv
+                // ============================================================
+
+                stage('1.2 Python Venv Setup') {
+
+                    steps {
+
+                        echo '[Stage1.2] Setting up Python virtual environment'
+
+                        script {
+
+                            if (params.DRY_RUN.toBoolean()) {
+
+                                echo '[DRY-RUN] would create/activate venv and install requirements'
+
+                            } else {
+
+                                bat '''
+@echo off
+
+cd /d "%W4%"
+
+if not exist ".venv\\Scripts\\python.exe" (
+
+    echo [venv] Creating virtual environment...
+
+    python -m venv .venv
+
+) else (
+
+    echo [venv] Reusing existing virtual environment
+
+)
+
+
+echo [venv] Installing dependencies...
+
+".venv\\Scripts\\python.exe" -m pip install --quiet -r requirements.txt
+
+
+echo [venv] Setup complete
+
+".venv\\Scripts\\python.exe" --version
+'''
+                            }
+                        }
+
+
+                        echo '[PASS] venv-setup complete'
+                    }
+                }
             }
-          }
         }
 
-        stage('2.2 Build App') {
-          steps {
-            echo '[Stage2.2] Compiling GR5526 APP (SDK 1.0.4)'
-            script {
-              if (params.DRY_RUN.toBoolean()) {
-                echo '[DRY-RUN] would: cd APP_GCC && mingw32-make SDK_ROOT=...'
-                echo '[DRY-RUN] would: if link fails, retry with response file'
-                echo '[DRY-RUN] would: generate_image_info.py -> app_fw.bin'
-                env.APP_BUILD_STATUS = 'dry-run'
-              } else {
-                // Build app. Known issue: link may fail due to command line length.
-                // Strategy: make (compile), if link fails -> retry with response file.
-                // P0-3: If all fails -> STOP by default. Only use old app_fw.bin
-                //       when ALLOW_PREBUILT_FIRMWARE=true (explicit opt-in).
-                def appRc = bat(returnStatus: true, script: '''@echo off
+
+        // ====================================================================
+        // Stage 2
+        // Build
+        // ====================================================================
+
+        stage('2. Build') {
+
+            when {
+
+                expression {
+
+                    return !params.SKIP_BUILD.toBoolean()
+                }
+            }
+
+
+            parallel {
+
+
+                // ============================================================
+                // 2.1 Bootloader
+                // ============================================================
+
+                stage('2.1 Build Bootloader') {
+
+                    steps {
+
+                        echo '[Stage2.1] Compiling GR5526 bootloader (SDK 1.0.3)'
+
+
+                        script {
+
+                            if (params.DRY_RUN.toBoolean()) {
+
+                                echo '[DRY-RUN] would: cd selected BL_PROJECT_PATH'
+                                echo '[DRY-RUN] would: mingw32-make clean'
+                                echo '[DRY-RUN] would: mingw32-make'
+                                echo '[DRY-RUN] would: generate bl_fw.bin'
+
+                                env.BL_BUILD_STATUS = 'dry-run'
+
+                            } else {
+
+                                // ------------------------------------------------
+                                // Build Bootloader
+                                // ------------------------------------------------
+
+                                bat '''
+@echo off
+
+cd /d "%BL_GCC%"
+
+echo [build-boot] Cleaning...
+
+mingw32-make clean 2>&1
+
+
+echo [build-boot] Compiling...
+
+mingw32-make 2>&1
+
+if errorlevel 1 (
+
+    echo [FAIL] bootloader make failed
+
+    exit /b 1
+)
+
+
+if not exist "out\\app_bootloader.bin" (
+
+    echo [FAIL] app_bootloader.bin not produced
+
+    exit /b 1
+)
+
+
+echo [PASS] bootloader compiled:
+echo        out\\app_bootloader.bin
+'''
+
+
+                                // ------------------------------------------------
+                                // Generate bootloader image
+                                // ------------------------------------------------
+
+                                echo '[build-boot] Generating bl_fw.bin with Image Info via GR5xxx_console'
+
+
+                                grConsole(
+                                    "generate \"${env.BL_GCC}\\out\\app_bootloader.bin\" \"${env.W4}\\bl_fw.bin\" 0x00200000 1024 1"
+                                )
+
+
+                                env.BL_BUILD_STATUS = 'success'
+
+
+                                echo '[PASS] build-boot: bl_fw.bin generated'
+                            }
+                        }
+                    }
+                }
+
+
+                // ============================================================
+                // 2.2 APP
+                // ============================================================
+
+                stage('2.2 Build App') {
+
+                    steps {
+
+                        echo '[Stage2.2] Compiling GR5526 APP (SDK 1.0.4)'
+
+
+                        script {
+
+                            if (params.DRY_RUN.toBoolean()) {
+
+                                echo '[DRY-RUN] would: cd selected APP_PROJECT_PATH'
+                                echo '[DRY-RUN] would: mingw32-make SDK_ROOT=...'
+                                echo '[DRY-RUN] would: retry link with response file if necessary'
+                                echo '[DRY-RUN] would: generate app_fw.bin'
+
+                                env.APP_BUILD_STATUS = 'dry-run'
+
+                            } else {
+
+                                // ------------------------------------------------
+                                // Build APP
+                                // ------------------------------------------------
+                                //
+                                // Known issue:
+                                // linker command line can become too long.
+                                //
+                                // Attempt 1:
+                                //   normal make
+                                //
+                                // Attempt 2:
+                                //   response file
+                                //
+
+                                def appRc = bat(
+                                    returnStatus: true,
+                                    script: '''
+@echo off
+
 cd /d "%APP_GCC%"
+
+
 echo [build-app] Cleaning...
+
 mingw32-make SDK_ROOT="%APP_SDK%" clean 2>&1
+
+
 echo [build-app] Compiling (attempt 1)...
+
 mingw32-make SDK_ROOT="%APP_SDK%" 2>&1
+
+
 if exist "out\\lst\\ble_app_uart_c.elf" goto build_ok
-echo [WARN] Link failed on attempt 1. Retrying with response file...
+
+
+echo [WARN] Link failed on attempt 1.
+echo [WARN] Retrying with response file...
+
+
 if not exist "out\\obj" goto build_fail
+
+
 dir /b /s out\\obj\\*.o > obj_list.txt
+
+
 echo [build-app] Linking (attempt 2 with response file)...
+
 mingw32-make SDK_ROOT="%APP_SDK%" OBJ_ADJUST="@obj_list.txt" 2>&1
+
+
 if exist "out\\lst\\ble_app_uart_c.elf" goto build_ok
+
+
 goto build_fail
 
+
 :build_ok
+
 echo [build-app] Generating .bin...
+
+
 if not exist "out\\ble_app_uart_c.bin" goto build_fail
-echo [PASS] app compiled: out\\ble_app_uart_c.bin
+
+
+echo [PASS] app compiled:
+echo        out\\ble_app_uart_c.bin
+
 exit /b 0
 
+
 :build_fail
+
 echo [WARN] App build failed.
+
+
 if exist "%W4%\\app_fw.bin" (
+
     echo [INFO] Existing app_fw.bin found (pre-built)
+
     exit /b 2
+
 ) else (
+
     echo [FAIL] App build failed and no existing app_fw.bin found
+
     exit /b 1
-)''')
-                echo "[build-app] make exit code: ${appRc}"
-                if (appRc == 0) {
-                  echo '[build-app] Generating app_fw.bin with Image Info'
-                  bat '@"%VENV_PY%" "%TOOLS%\\generate_image_info.py" --input "%APP_GCC%\\out\\ble_app_uart_c.bin" --output "%W4%\\app_fw.bin" --load-addr 0x00240000 --name ble_app_uart_c'
-                  env.APP_BUILD_STATUS = 'success'
-                  echo '[PASS] build-app: app_fw.bin generated from fresh build'
-                } else if (appRc == 2) {
-                  // P0-3: exit code 2 = prebuilt firmware exists. Only use it if explicitly allowed.
-                  if (params.ALLOW_PREBUILT_FIRMWARE.toBoolean()) {
-                    env.APP_BUILD_STATUS = 'prebuilt-firmware'
-                    echo '[WARN] WARNING: Using PREBUILT firmware. This firmware was NOT produced by current build.'
-                  } else {
-                    error('App build FAILED and ALLOW_PREBUILT_FIRMWARE=false. Set ALLOW_PREBUILT_FIRMWARE=true to use existing app_fw.bin.')
-                  }
-                } else {
-                  error('App build FAILED and no existing app_fw.bin available')
+)
+'''
+                                )
+
+
+                                echo "[build-app] make exit code: ${appRc}"
+
+
+                                if (appRc == 0) {
+
+                                    // ------------------------------------------------
+                                    // Generate app image
+                                    // ------------------------------------------------
+
+                                    echo '[build-app] Generating app_fw.bin with Image Info'
+
+
+                                    bat(
+                                        '@"%VENV_PY%" "%TOOLS%\\generate_image_info.py" ' +
+                                        '--input "%APP_GCC%\\out\\ble_app_uart_c.bin" ' +
+                                        '--output "%W4%\\app_fw.bin" ' +
+                                        '--load-addr 0x00240000 ' +
+                                        '--name ble_app_uart_c'
+                                    )
+
+
+                                    env.APP_BUILD_STATUS = 'success'
+
+
+                                    echo '[PASS] build-app: app_fw.bin generated from fresh build'
+
+
+                                } else if (appRc == 2) {
+
+                                    // ------------------------------------------------
+                                    // Prebuilt firmware
+                                    // ------------------------------------------------
+
+                                    if (
+                                        params.ALLOW_PREBUILT_FIRMWARE.toBoolean()
+                                    ) {
+
+                                        env.APP_BUILD_STATUS =
+                                            'prebuilt-firmware'
+
+
+                                        echo '[WARN] WARNING: Using PREBUILT firmware.'
+                                        echo '[WARN] This firmware was NOT produced by current build.'
+
+                                    } else {
+
+                                        error(
+                                            'App build FAILED and ALLOW_PREBUILT_FIRMWARE=false. ' +
+                                            'Set ALLOW_PREBUILT_FIRMWARE=true to use existing app_fw.bin.'
+                                        )
+                                    }
+
+
+                                } else {
+
+                                    error(
+                                        'App build FAILED and no existing app_fw.bin available'
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
-              }
             }
-          }
+
+
+            post {
+
+                failure {
+
+                    echo '[WARN] Stage 2 build had failures.'
+
+
+                    script {
+
+                        if (!env.BL_BUILD_STATUS) {
+
+                            env.BL_BUILD_STATUS = 'failed'
+                        }
+
+
+                        if (!env.APP_BUILD_STATUS) {
+
+                            env.APP_BUILD_STATUS = 'failed'
+                        }
+                    }
+                }
+            }
         }
-      }
-      post {
+
+
+        // ====================================================================
+        // Stage 3
+        // Firmware Metadata
+        // ====================================================================
+
+        stage('3. Generate Firmware Metadata') {
+
+            when {
+
+                expression {
+
+                    return !params.SKIP_BUILD.toBoolean()
+                }
+            }
+
+
+            steps {
+
+                echo '[Stage3] Generating firmware metadata for CI traceability'
+
+
+                script {
+
+                    bat '''
+@if not exist "%ARTIFACTS%" mkdir "%ARTIFACTS%"
+'''
+
+
+                    bat '''
+@"%VENV_PY%" "%TOOLS%\\firmware_metadata.py" generate ^
+ --chip "%CHIP%" ^
+ --build-number "%BUILD_NUMBER%" ^
+ --bootloader-sdk "1.0.3" ^
+ --app-sdk "1.0.4" ^
+ --app-image "app_fw.bin" ^
+ --build-type "%BL_BUILD_STATUS%-APP-%APP_BUILD_STATUS%" ^
+ --workspace "%W4%" ^
+ --output "%ARTIFACTS%\\firmware_metadata.json"
+'''
+
+
+                    echo '[PASS] firmware_metadata.json generated'
+                }
+            }
+        }
+
+
+        // ====================================================================
+        // Stage 4
+        // Flash
+        // ====================================================================
+
+        stage('4. Flash') {
+
+            when {
+
+                expression {
+
+                    return !params.SKIP_FLASH.toBoolean()
+                }
+            }
+
+
+            stages {
+
+
+                // ============================================================
+                // 4.1 Detect Firmware Layout
+                // ============================================================
+
+                stage('4.1 Detect Firmware Layout') {
+
+                    steps {
+
+                        echo '[Stage4.1] Detecting firmware layout'
+
+
+                        script {
+
+                            def blMap =
+                                "${env.BL_GCC}\\out\\lst\\app_bootloader.map"
+
+                            def appMap =
+                                "${env.APP_GCC}\\out\\lst\\ble_app_uart_c.map"
+
+                            def blBin =
+                                "${env.W4}\\bl_fw.bin"
+
+                            def appBin =
+                                "${env.W4}\\app_fw.bin"
+
+
+                            // ------------------------------------------------
+                            // Required files
+                            // ------------------------------------------------
+
+                            bat """
+@if not exist "${blMap}" (
+    echo ERROR: BL map missing
+    exit /b 1
+)
+
+@if not exist "${blBin}" (
+    echo ERROR: bl_fw.bin missing
+    exit /b 1
+)
+
+@if not exist "${appBin}" (
+    echo ERROR: app_fw.bin missing
+    exit /b 1
+)
+"""
+
+
+                            // ------------------------------------------------
+                            // Detect layout
+                            // ------------------------------------------------
+
+                            def layoutCmd =
+                                "@\"${env.VENV_PY}\" " +
+                                "\"${env.TOOLS}\\detect_firmware_layout.py\" " +
+                                "--bl-map \"${blMap}\" " +
+                                "--bl-bin \"${blBin}\" " +
+                                "--app-bin \"${appBin}\""
+
+
+                            // ------------------------------------------------
+                            // APP map is optional
+                            // ------------------------------------------------
+
+                            def appMapExists =
+                                bat(
+                                    returnStatus: true,
+                                    script:
+                                        "@if exist \"${appMap}\" exit /b 0 else exit /b 1"
+                                ) == 0
+
+
+                            if (appMapExists) {
+
+                                layoutCmd +=
+                                    " --app-map \"${appMap}\""
+
+                            } else {
+
+                                echo '[WARN] APP map file not found. APP RTT addr will use default/scan.'
+                            }
+
+
+                            // ------------------------------------------------
+                            // Run detection
+                            // ------------------------------------------------
+
+                            def layoutOut =
+                                bat(
+                                    returnStdout: true,
+                                    script: layoutCmd
+                                ).trim()
+
+
+                            layoutOut.split('\n').each { line ->
+
+                                def parts =
+                                    line.split('=', 2)
+
+
+                                if (parts.length == 2) {
+
+                                    def key =
+                                        parts[0].trim()
+
+                                    def val =
+                                        parts[1].trim()
+
+
+                                    if (
+                                        key &&
+                                        key ==~ /[A-Z_]+/
+                                    ) {
+
+                                        env."${key}" = val
+                                    }
+                                }
+                            }
+
+
+                            // ------------------------------------------------
+                            // Layout validation
+                            // ------------------------------------------------
+
+                            if (!env.BL_ADDR || !env.APP_ADDR) {
+
+                                if (
+                                    params.ALLOW_LAYOUT_FALLBACK.toBoolean()
+                                ) {
+
+                                    echo '[WARN] WARNING: Firmware layout fallback is enabled.'
+                                    echo '[WARN] This build MUST NOT be considered production CI.'
+                                    echo '[WARN] Using hardcoded development layout addresses.'
+
+
+                                    env.BL_ADDR =
+                                        '0x00204000'
+
+                                    env.BL_END =
+                                        '0x0023FFFF'
+
+                                    env.APP_ADDR =
+                                        '0x00240000'
+
+                                    env.APP_END =
+                                        '0x00297FFF'
+
+                                    env.BANK_B_ADDR =
+                                        '0x00298000'
+
+                                    env.BANK_B_END =
+                                        '0x002EFFFF'
+
+
+                                } else {
+
+                                    error(
+                                        'Firmware layout detection FAILED - ' +
+                                        'missing BL_ADDR or APP_ADDR. ' +
+                                        'Set ALLOW_LAYOUT_FALLBACK=true only in development.'
+                                    )
+                                }
+                            }
+
+
+                            echo(
+                                "Layout detected: " +
+                                "BL=${env.BL_ADDR}-${env.BL_END} " +
+                                "APP=${env.APP_ADDR}-${env.APP_END} " +
+                                "BANK_B=${env.BANK_B_ADDR}-${env.BANK_B_END} " +
+                                "NVDS=${env.NVDS_ADDR}"
+                            )
+
+
+                            echo(
+                                "RTT: " +
+                                "BL=${env.BL_RTT_ADDR} " +
+                                "APP=${env.APP_RTT_ADDR ?: 'not detected (will scan)'}"
+                            )
+                        }
+                    }
+                }
+
+
+                // ============================================================
+                // 4.2 Verify Firmware Metadata
+                // ============================================================
+
+                stage('4.2 Verify Firmware Metadata') {
+
+                    steps {
+
+                        echo '[Stage4.2] Verifying firmware metadata'
+
+
+                        script {
+
+                            def metaPath =
+                                "${env.ARTIFACTS}\\firmware_metadata.json"
+
+
+                            if (fileExists(metaPath)) {
+
+                                bat '''
+@"%VENV_PY%" "%TOOLS%\\firmware_metadata.py" verify ^
+ --metadata "%ARTIFACTS%\\firmware_metadata.json" ^
+ --workspace "%W4%"
+'''
+
+
+                                echo '[PASS] firmware_metadata.json verified'
+
+                            } else {
+
+                                echo '[WARN] firmware_metadata.json not found. Skipping metadata verification.'
+                            }
+                        }
+                    }
+                }
+
+
+                // ============================================================
+                // 4.3 Generate & Validate Flash Plan
+                // ============================================================
+
+                stage('4.3 Generate & Validate Flash Plan') {
+
+                    steps {
+
+                        echo '[Stage4.3] Generating flash plan'
+
+
+                        script {
+
+                            // ------------------------------------------------
+                            // Generate plan
+                            // ------------------------------------------------
+
+                            bat '''
+@"%VENV_PY%" "%CI_DIR%\\flash_plan.py" generate ^
+ --chip "%CHIP%" ^
+ --bl-addr "%BL_ADDR%" ^
+ --bl-end "%BL_END%" ^
+ --app-addr "%APP_ADDR%" ^
+ --app-end "%APP_END%" ^
+ --bank-b-addr "%BANK_B_ADDR%" ^
+ --bank-b-end "%BANK_B_END%" ^
+ --nvds-addr "%NVDS_ADDR%" ^
+ --output "%ARTIFACTS%\\flash_plan.json"
+'''
+
+
+                            echo '[PASS] flash_plan.json generated'
+
+
+                            // ------------------------------------------------
+                            // Validate plan
+                            // ------------------------------------------------
+
+                            bat '''
+@"%VENV_PY%" "%CI_DIR%\\flash_plan.py" validate ^
+ --plan "%ARTIFACTS%\\flash_plan.json"
+'''
+
+
+                            echo '[PASS] flash_plan.json validated'
+                            echo '[PASS] NVDS preserved'
+                            echo '[PASS] App-first / Bootloader-last confirmed'
+                        }
+                    }
+                }
+
+
+                // ============================================================
+                // 4.4 Human Confirmation
+                // ============================================================
+
+                stage('4.4 Hardware Flash Confirmation') {
+
+                    when {
+
+                        expression {
+
+                            return !params.DRY_RUN.toBoolean()
+                        }
+                    }
+
+
+                    steps {
+
+                        echo '[Stage4.4] AWAITING HUMAN CONFIRMATION before real hardware flash'
+
+
+                        script {
+
+                            input(
+                                message:
+                                    'Confirm GR5526 hardware erase/program?',
+                                ok:
+                                    'Flash Device'
+                            )
+
+
+                            echo '[PASS] Human confirmation received.'
+                            echo '[INFO] Proceeding with hardware flash.'
+                        }
+                    }
+                }
+
+
+                // ============================================================
+                // 4.5 Erase
+                // ============================================================
+
+                stage('4.5 Erase Flash Regions') {
+
+                    steps {
+
+                        echo '[Stage4.5] Erasing BL + Bank A + Bank B'
+                        echo '[HARD RULE] NVDS preserved. NO eraseall.'
+
+
+                        script {
+
+                            // ------------------------------------------------
+                            // Bootloader region
+                            // ------------------------------------------------
+
+                            grConsole(
+                                "eraseFlash " +
+                                "--start ${env.BL_ADDR} " +
+                                "--end ${env.BL_END} " +
+                                "--chip ${env.CHIP} " +
+                                "--jlink ${env.JLINK_IDX}"
+                            )
+
+
+                            echo(
+                                "-> Bootloader region " +
+                                "${env.BL_ADDR}-${env.BL_END} erased"
+                            )
+
+
+                            // ------------------------------------------------
+                            // Bank A / APP
+                            // ------------------------------------------------
+
+                            grConsole(
+                                "eraseFlash " +
+                                "--start ${env.APP_ADDR} " +
+                                "--end ${env.APP_END} " +
+                                "--chip ${env.CHIP} " +
+                                "--jlink ${env.JLINK_IDX}"
+                            )
+
+
+                            echo(
+                                "-> Bank A " +
+                                "${env.APP_ADDR}-${env.APP_END} erased"
+                            )
+
+
+                            // ------------------------------------------------
+                            // Bank B
+                            // ------------------------------------------------
+
+                            grConsole(
+                                "eraseFlash " +
+                                "--start ${env.BANK_B_ADDR} " +
+                                "--end ${env.BANK_B_END} " +
+                                "--chip ${env.CHIP} " +
+                                "--jlink ${env.JLINK_IDX}"
+                            )
+
+
+                            echo(
+                                "-> Bank B " +
+                                "${env.BANK_B_ADDR}-${env.BANK_B_END} erased"
+                            )
+
+
+                            echo '[PASS] Erase complete'
+                            echo '[PASS] NVDS preserved'
+                            echo '[PASS] No eraseall'
+                        }
+                    }
+                }
+
+
+                // ============================================================
+                // 4.6 Program APP FIRST
+                // ============================================================
+
+                stage('4.6 Program App (FIRST)') {
+
+                    steps {
+
+                        echo '[Stage4.6] Programming APP FIRST'
+                        echo '[HARD RULE] APP must be programmed BEFORE Bootloader'
+
+
+                        script {
+
+                            grConsole(
+                                "program " +
+                                "--chip ${env.CHIP} " +
+                                "--file \"${env.W4}\\app_fw.bin\" " +
+                                "--erase 2 " +
+                                "--run false " +
+                                "--jlink ${env.JLINK_IDX}"
+                            )
+
+
+                            echo '[PASS] APP programmed FIRST'
+                        }
+                    }
+                }
+
+
+                // ============================================================
+                // 4.7 Program Bootloader LAST
+                // ============================================================
+
+                stage('4.7 Program Bootloader (LAST)') {
+
+                    steps {
+
+                        echo '[Stage4.7] Programming Bootloader LAST'
+                        echo '[HARD RULE] Bootloader MUST be programmed LAST'
+                        echo '[INFO] SCA final -> Bootloader'
+
+
+                        script {
+
+                            grConsole(
+                                "program " +
+                                "--chip ${env.CHIP} " +
+                                "--file \"${env.W4}\\bl_fw.bin\" " +
+                                "--erase 2 " +
+                                "--run false " +
+                                "--jlink ${env.JLINK_IDX}"
+                            )
+
+
+                            echo '[PASS] Bootloader programmed LAST'
+                            echo '[PASS] SCA final -> Bootloader'
+                        }
+                    }
+                }
+
+
+                // ============================================================
+                // 4.8 Flash Verify
+                // ============================================================
+
+                stage('4.8 Flash Verify (MANDATORY GATE)') {
+
+                    steps {
+
+                        echo '[Stage4.8] Verifying flash contents'
+                        echo '[HARD RULE] Verification failure stops pipeline'
+
+
+                        script {
+
+                            // ------------------------------------------------
+                            // Dump Bank A
+                            // ------------------------------------------------
+
+                            grConsole(
+                                "dump " +
+                                "${env.APP_ADDR} " +
+                                "64 " +
+                                "\"${env.WORKSPACE}\\verify_bank_a.bin\" " +
+                                "${env.JLINK_IDX}"
+                            )
+
+
+                            echo '-> Bank A dump created'
+
+
+                            // ------------------------------------------------
+                            // Dump SCA
+                            // ------------------------------------------------
+
+                            grConsole(
+                                "dump " +
+                                "0x00200000 " +
+                                "256 " +
+                                "\"${env.WORKSPACE}\\verify_sca.bin\" " +
+                                "${env.JLINK_IDX}"
+                            )
+
+
+                            echo '-> SCA dump created'
+
+
+                            // ------------------------------------------------
+                            // Verify
+                            // ------------------------------------------------
+
+                            echo 'Running flash verification...'
+
+
+                            bat '''
+@"%VENV_PY%" "%TOOLS%\\verify_flash.py"
+'''
+
+
+                            echo '[PASS] Flash verification passed'
+                        }
+                    }
+                }
+
+
+                // ============================================================
+                // 4.9 Reset
+                // ============================================================
+
+                stage('4.9 Reset Device') {
+
+                    steps {
+
+                        echo '[Stage4.9] Resetting device via GR5xxx_console'
+                        echo '[HARD RULE] NO J-Link reset'
+
+
+                        script {
+
+                            grConsole(
+                                'reset 1 0'
+                            )
+
+
+                            echo 'Waiting 5s for GR5526 boot + RTT ready ...'
+
+
+                            bat '''
+@ping -n 6 127.0.0.1 >nul
+'''
+
+
+                            echo '[PASS] Device reset via GR5xxx_console'
+                        }
+                    }
+                }
+            }
+        }
+
+
+        // ====================================================================
+        // Stage 5
+        // Hardware Test / RTT Diagnostic
+        // ====================================================================
+
+        stage('5. Hardware Test (RTT Diagnostic)') {
+
+            steps {
+
+                echo '[Stage5] RTT diagnostic test'
+                echo '[INFO] BL RTT -> wait for BL to APP -> APP RTT'
+                echo '[INFO] RTT failure = UNSTABLE, not FAIL'
+
+
+                script {
+
+                    if (!env.BL_RTT_ADDR) {
+
+                        echo '[WARN] BL_RTT_ADDR not detected.'
+                    }
+
+
+                    def blRtt =
+                        env.BL_RTT_ADDR ?: '0x2000C830'
+
+
+                    def appRtt =
+                        env.APP_RTT_ADDR ?: '0x2000D000'
+
+
+                    def blKw =
+                        params.BL_KEYWORD ?: ''
+
+
+                    def appKw =
+                        params.APP_KEYWORD ?: ''
+
+
+                    // --------------------------------------------------------
+                    // DRY RUN
+                    // --------------------------------------------------------
+
+                    if (params.DRY_RUN.toBoolean()) {
+
+                        echo(
+                            "[DRY-RUN] test_rtt_with_jump.py " +
+                            "--bl-rtt-addr ${blRtt} " +
+                            "--app-rtt-addr ${appRtt} " +
+                            "--jlink-serial ${env.JLINK_SERIAL} " +
+                            "--bl-keyword '${blKw}' " +
+                            "--app-keyword '${appKw}' " +
+                            "--output rtt_result.json"
+                        )
+
+
+                        echo(
+                            "[DRY-RUN] Would reset device and read BL RTT"
+                        )
+
+
+                        echo(
+                            "[DRY-RUN] Would wait for BL -> APP jump"
+                        )
+
+
+                        echo(
+                            "[DRY-RUN] Would read APP RTT"
+                        )
+
+
+                    } else {
+
+                        // ----------------------------------------------------
+                        // Real RTT test
+                        // ----------------------------------------------------
+
+                        def testCmd =
+                            "@\"${env.VENV_PY}\" " +
+                            "\"${env.TOOLS}\\test_rtt_with_jump.py\" " +
+                            "--bl-rtt-addr ${blRtt} " +
+                            "--app-rtt-addr ${appRtt} " +
+                            "--jlink-serial ${env.JLINK_SERIAL} " +
+                            "--bl-timeout 8 " +
+                            "--jump-timeout 20 " +
+                            "--output " +
+                            "\"${env.WORKSPACE}\\rtt_result.json\""
+
+
+                        if (blKw) {
+
+                            testCmd +=
+                                " --bl-keyword \"${blKw}\""
+                        }
+
+
+                        if (appKw) {
+
+                            testCmd +=
+                                " --app-keyword \"${appKw}\""
+                        }
+
+
+                        echo(
+                            "Running RTT diagnostic " +
+                            "(BL=${blRtt}, APP=${appRtt}) ..."
+                        )
+
+
+                        def testExit =
+                            bat(
+                                returnStatus: true,
+                                script: testCmd
+                            )
+
+
+                        if (testExit != 0) {
+
+                            echo(
+                                "[WARN] RTT diagnostic exited with code ${testExit}"
+                            )
+
+
+                            echo(
+                                '[WARN] Check rtt_result.json for details.'
+                            )
+
+
+                            // RTT is diagnostic only.
+                            currentBuild.result = 'UNSTABLE'
+
+
+                        } else {
+
+                            echo '[PASS] RTT diagnostic passed'
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    // ========================================================================
+    // Post
+    // ========================================================================
+
+    post {
+
+        success {
+
+            echo 'gr5526-ci PASSED.'
+        }
+
+
         failure {
-          echo '[WARN] Stage 2 build had failures.'
-          script {
-            if (!env.BL_BUILD_STATUS) { env.BL_BUILD_STATUS = 'failed' }
-            if (!env.APP_BUILD_STATUS) { env.APP_BUILD_STATUS = 'failed' }
-          }
+
+            echo 'gr5526-ci FAILED.'
         }
-      }
-    }
 
-    // ========================================================================
-    // Stage 3: Generate Firmware Metadata (P0-4)
-    // ========================================================================
-    stage('3. Generate Firmware Metadata') {
-      when { expression { return !params.SKIP_BUILD.toBoolean() } }
-      steps {
-        echo '[Stage3] Generating firmware metadata for CI traceability'
-        script {
-          bat '@if not exist "%ARTIFACTS%" mkdir "%ARTIFACTS%"'
-          bat '@"%VENV_PY%" "%TOOLS%\\firmware_metadata.py" generate --chip "%CHIP%" --build-number "%BUILD_NUMBER%" --bootloader-sdk "1.0.3" --app-sdk "1.0.4" --app-image "app_fw.bin" --build-type "%BL_BUILD_STATUS%-APP-%APP_BUILD_STATUS%" --workspace "%W4%" --output "%ARTIFACTS%\\firmware_metadata.json"'
-          echo '[PASS] firmware_metadata.json generated'
+
+        unstable {
+
+            echo 'gr5526-ci UNSTABLE (RTT diagnostic may have failed).'
         }
-      }
-    }
 
-    // ========================================================================
-    // Stage 4: Flash (detect layout -> plan -> confirm -> erase -> app first -> boot last -> verify -> reset)
-    // ========================================================================
-    stage('4. Flash') {
-      when { expression { return !params.SKIP_FLASH.toBoolean() } }
-      stages {
 
-        // --- 4.1 Detect firmware layout ---
-        stage('4.1 Detect Firmware Layout') {
-          steps {
-            echo '[Stage4.1] Detecting firmware layout (RTT addr, Image Info, flash partitions)'
+        always {
+
+            echo(
+                "gr5526-ci done. " +
+                "DRY_RUN=${params.DRY_RUN} " +
+                "SKIP_BUILD=${params.SKIP_BUILD} " +
+                "SKIP_FLASH=${params.SKIP_FLASH}"
+            )
+
+
+            echo(
+                "BL build: ${env.BL_BUILD_STATUS ?: 'n/a'} | " +
+                "APP build: ${env.APP_BUILD_STATUS ?: 'n/a'}"
+            )
+
+
+            // ---------------------------------------------------------------
+            // Generate standardized result JSON
+            // ---------------------------------------------------------------
+
+            echo '[Post] Generating test_result.json'
+
+
             script {
-              def blMap = "${env.BL_GCC}\\out\\lst\\app_bootloader.map"
-              def appMap = "${env.APP_GCC}\\out\\lst\\ble_app_uart_c.map"
-              def blBin = "${env.W4}\\bl_fw.bin"
-              def appBin = "${env.W4}\\app_fw.bin"
 
-              // Check map files exist; if app build failed, app map may be missing
-              bat "@if not exist \"${blMap}\" (echo ERROR: BL map missing & exit /b 1)"
-              bat "@if not exist \"${blBin}\" (echo ERROR: bl_fw.bin missing & exit /b 1)"
-              bat "@if not exist \"${appBin}\" (echo ERROR: app_fw.bin missing & exit /b 1)"
+                try {
 
-              def layoutCmd = "@\"${env.VENV_PY}\" \"${env.TOOLS}\\detect_firmware_layout.py\" --bl-map \"${blMap}\" --bl-bin \"${blBin}\" --app-bin \"${appBin}\""
-              // Add app map only if it exists
-              def appMapExists = bat(returnStatus: true, script: "@if exist \"${appMap}\" exit /b 0 else exit /b 1") == 0
-              if (appMapExists) {
-                layoutCmd += " --app-map \"${appMap}\""
-              } else {
-                echo '[WARN] APP map file not found (app build may have failed). APP RTT addr will use default/scan.'
-              }
+                    def flashStatus =
+                        params.SKIP_FLASH.toBoolean()
+                            ? 'SKIPPED'
+                            : (
+                                params.DRY_RUN.toBoolean()
+                                    ? 'DRY_RUN'
+                                    : (
+                                        currentBuild.currentResult == 'FAILURE'
+                                            ? 'FAIL'
+                                            : 'PASS'
+                                    )
+                            )
 
-              // Run layout detection. returnStdout does NOT throw on non-zero exit,
-              // so we parse the output and check for required fields below.
-              def layoutOut = bat(returnStdout: true, script: layoutCmd).trim()
-              layoutOut.split('\n').each { line ->
-                def parts = line.split('=', 2)
-                if (parts.length == 2) {
-                  def key = parts[0].trim()
-                  def val = parts[1].trim()
-                  if (key && key ==~ /[A-Z_]+/) {
-                    env."${key}" = val
-                  }
+
+                    def resultJson = [
+
+                        job:
+                            env.JOB_NAME ?: 'gr5526-ci',
+
+                        build_number:
+                            (env.BUILD_NUMBER ?: '0') as int,
+
+                        git_commit:
+                            env.GIT_COMMIT ?: 'unknown',
+
+                        chip:
+                            env.CHIP ?: 'GR5526',
+
+                        hardware_agent:
+                            env.NODE_LABELS ?: 'gr5526-hw',
+
+
+                        build_type:
+                            (env.BL_BUILD_STATUS ?: 'n/a') +
+                            '-' +
+                            (env.APP_BUILD_STATUS ?: 'n/a'),
+
+
+                        // ---------------------------------------------------
+                        // Firmware projects
+                        // ---------------------------------------------------
+
+                        firmware_projects: [
+
+                            bootloader:
+                                env.BL_GCC ?: 'n/a',
+
+                            app:
+                                env.APP_GCC ?: 'n/a'
+                        ],
+
+
+                        // ---------------------------------------------------
+                        // Flash result
+                        // ---------------------------------------------------
+
+                        flash: [
+
+                            erase:
+                                flashStatus,
+
+                            app_program:
+                                flashStatus,
+
+                            boot_program:
+                                flashStatus,
+
+                            verify:
+                                flashStatus
+                        ],
+
+
+                        // ---------------------------------------------------
+                        // Hardware test
+                        // ---------------------------------------------------
+
+                        boot_test:
+                            params.DRY_RUN.toBoolean()
+                                ? 'DRY_RUN'
+                                : (
+                                    currentBuild.result == 'UNSTABLE'
+                                        ? 'WARNING'
+                                        : 'PASS'
+                                ),
+
+
+                        app_test:
+                            params.DRY_RUN.toBoolean()
+                                ? 'DRY_RUN'
+                                : (
+                                    currentBuild.result == 'UNSTABLE'
+                                        ? 'WARNING'
+                                        : 'PASS'
+                                ),
+
+
+                        // ---------------------------------------------------
+                        // RTT
+                        // ---------------------------------------------------
+
+                        rtt: [
+
+                            status:
+                                currentBuild.result ?: 'PASS',
+
+                            bl_rtt_addr:
+                                env.BL_RTT_ADDR ?: 'not-detected',
+
+                            app_rtt_addr:
+                                env.APP_RTT_ADDR ?: 'not-detected',
+
+                            notes:
+                                'RTT is diagnostic/optional. UNSTABLE does not mean build failure.'
+                        ],
+
+
+                        warnings:
+                            [],
+
+
+                        timestamp:
+                            new Date().format(
+                                "yyyy-MM-dd'T'HH:mm:ss'Z'"
+                            )
+                    ]
+
+
+                    writeFile(
+
+                        file:
+                            "${env.ARTIFACTS}\\test_result.json",
+
+                        text:
+                            groovy.json.JsonOutput.prettyPrint(
+                                groovy.json.JsonOutput.toJson(
+                                    resultJson
+                                )
+                            )
+                    )
+
+
+                    echo '[PASS] test_result.json generated'
+
+
+                } catch (Exception e) {
+
+                    echo(
+                        "[WARN] Failed to generate test_result.json: " +
+                        "${e.getMessage()}"
+                    )
                 }
-              }
-
-              // P0-5: If layout detection failed (missing required addresses)
-              if (!env.BL_ADDR || !env.APP_ADDR) {
-                if (params.ALLOW_LAYOUT_FALLBACK.toBoolean()) {
-                  echo '[WARN] WARNING: Firmware layout fallback is enabled. This build MUST NOT be considered production CI.'
-                  echo '[WARN] Using hardcoded development layout addresses.'
-                  env.BL_ADDR = '0x00204000'
-                  env.BL_END = '0x0023FFFF'
-                  env.APP_ADDR = '0x00240000'
-                  env.APP_END = '0x00297FFF'
-                  env.BANK_B_ADDR = '0x00298000'
-                  env.BANK_B_END = '0x002EFFFF'
-                } else {
-                  error('Firmware layout detection FAILED - missing BL_ADDR or APP_ADDR. Set ALLOW_LAYOUT_FALLBACK=true only in development.')
-                }
-              }
-              echo "Layout detected: BL=${env.BL_ADDR}-${env.BL_END} APP=${env.APP_ADDR}-${env.APP_END} BANK_B=${env.BANK_B_ADDR}-${env.BANK_B_END} NVDS=${env.NVDS_ADDR}"
-              echo "RTT: BL=${env.BL_RTT_ADDR} APP=${env.APP_RTT_ADDR ?: 'not detected (will scan)'}"
             }
-          }
+
+
+            // ---------------------------------------------------------------
+            // Archive artifacts
+            // ---------------------------------------------------------------
+
+            archiveArtifacts(
+
+                artifacts:
+                    'artifacts/*.json,' +
+                    '*.json,' +
+                    '*.py,' +
+                    '*.bin,' +
+                    'verify_*.bin,' +
+                    'rtt_result.json,' +
+                    'obj_list.txt',
+
+                allowEmptyArchive:
+                    true
+            )
         }
-
-        // --- 4.2 Verify metadata git_commit match (P0-4) ---
-        stage('4.2 Verify Firmware Metadata') {
-          steps {
-            echo '[Stage4.2] Verifying firmware metadata git_commit matches current build'
-            script {
-              def metaPath = "${env.ARTIFACTS}\\firmware_metadata.json"
-              if (fileExists(metaPath)) {
-                bat '@"%VENV_PY%" "%TOOLS%\\firmware_metadata.py" verify --metadata "%ARTIFACTS%\\firmware_metadata.json" --workspace "%W4%"'
-                echo '[PASS] firmware_metadata.json verified: git_commit matches current HEAD'
-              } else {
-                echo '[WARN] firmware_metadata.json not found (build may have been skipped). Skipping metadata verification.'
-              }
-            }
-          }
-        }
-
-        // --- 4.3 Generate and Validate Flash Plan (P1-3) ---
-        stage('4.3 Generate & Validate Flash Plan') {
-          steps {
-            echo '[Stage4.3] Generating flash plan and validating safety rules'
-            script {
-              // Generate flash_plan.json
-              bat '@"%VENV_PY%" "%CI_DIR%\\flash_plan.py" generate --chip "%CHIP%" --bl-addr "%BL_ADDR%" --bl-end "%BL_END%" --app-addr "%APP_ADDR%" --app-end "%APP_END%" --bank-b-addr "%BANK_B_ADDR%" --bank-b-end "%BANK_B_END%" --nvds-addr "%NVDS_ADDR%" --output "%ARTIFACTS%\\flash_plan.json"'
-              echo '[PASS] flash_plan.json generated'
-
-              // Validate flash plan against safety rules
-              bat '@"%VENV_PY%" "%CI_DIR%\\flash_plan.py" validate --plan "%ARTIFACTS%\\flash_plan.json"'
-              echo '[PASS] flash_plan.json validated: NVDS preserved, App-first/BL-last confirmed'
-            }
-          }
-        }
-
-        // --- 4.4 Hardware Flash Confirmation (P1-4, only when DRY_RUN=false) ---
-        stage('4.4 Hardware Flash Confirmation') {
-          when { expression { return !params.DRY_RUN.toBoolean() } }
-          steps {
-            echo '[Stage4.4] AWAITING HUMAN CONFIRMATION before real hardware flash'
-            script {
-              // input step requires script {} wrapper in Declarative Pipeline
-              input(message: 'Confirm GR5526 hardware erase/program?', ok: 'Flash Device')
-              echo '[PASS] Human confirmation received. Proceeding with hardware flash.'
-            }
-          }
-        }
-
-        // --- 4.5 Erase (BL, Bank A, Bank B) ---
-        stage('4.5 Erase Flash Regions') {
-          steps {
-            echo '[Stage4.5] Erasing flash regions (BL, Bank A, Bank B). NVDS preserved.'
-            echo 'HARD RULE: GR5xxx_console ONLY. NO J-Link flash. NVDS 0x002EF000 NOT erased. NO eraseall.'
-            script {
-              grConsole("eraseFlash --start ${env.BL_ADDR} --end ${env.BL_END} --chip ${env.CHIP} --jlink ${env.JLINK_IDX}")
-              echo "  -> Bootloader region ${env.BL_ADDR}-${env.BL_END} erased"
-              grConsole("eraseFlash --start ${env.APP_ADDR} --end ${env.APP_END} --chip ${env.CHIP} --jlink ${env.JLINK_IDX}")
-              echo "  -> Bank A ${env.APP_ADDR}-${env.APP_END} erased"
-              grConsole("eraseFlash --start ${env.BANK_B_ADDR} --end ${env.BANK_B_END} --chip ${env.CHIP} --jlink ${env.JLINK_IDX}")
-              echo "  -> Bank B ${env.BANK_B_ADDR}-${env.BANK_B_END} erased"
-              echo '[PASS] Erase complete (BL + Bank A + Bank B). NVDS preserved. No eraseall.'
-            }
-          }
-        }
-
-        // --- 4.6 Program App FIRST (critical order) ---
-        stage('4.6 Program App (FIRST)') {
-          steps {
-            echo '[Stage4.6] Programming App FIRST (--erase 2: SCA erased+rewritten -> App, temporary)'
-            echo 'HARD RULE: App must be programmed BEFORE Bootloader. SCA temporarily points to App.'
-            script {
-              grConsole("program --chip ${env.CHIP} --file \"${env.W4}\\app_fw.bin\" --erase 2 --run false --jlink ${env.JLINK_IDX}")
-              echo '[PASS] App programmed (FIRST)'
-            }
-          }
-        }
-
-        // --- 4.7 Program Bootloader LAST (critical order) ---
-        stage('4.7 Program Bootloader (LAST)') {
-          steps {
-            echo '[Stage4.7] Programming Bootloader LAST (--erase 2: SCA erased+rewritten -> Bootloader, CRITICAL)'
-            echo 'HARD RULE: Bootloader MUST be programmed LAST so SCA finally points to Bootloader.'
-            script {
-              // --erase 2 erases SCA/bootinfo area then rewrites SCA -> Bootloader (final)
-              grConsole("program --chip ${env.CHIP} --file \"${env.W4}\\bl_fw.bin\" --erase 2 --run false --jlink ${env.JLINK_IDX}")
-              echo '[PASS] Bootloader programmed (LAST). SCA final -> Bootloader.'
-            }
-          }
-        }
-
-        // --- 4.8 Flash Verify (MANDATORY GATE - P1-5) ---
-        stage('4.8 Flash Verify (MANDATORY GATE)') {
-          steps {
-            echo '[Stage4.8] Verifying flash contents - MANDATORY GATE'
-            echo 'HARD RULE: If verification FAILS, pipeline STOPS. Do NOT proceed to hardware test.'
-            script {
-              // Dump Bank A (App region, first 64 bytes)
-              grConsole("dump ${env.APP_ADDR} 64 \"${env.WORKSPACE}\\verify_bank_a.bin\" ${env.JLINK_IDX}")
-              echo "  -> Bank A dump: verify_bank_a.bin"
-              // Dump SCA (System Configuration Area, 256 bytes from 0x00200000)
-              grConsole("dump 0x00200000 256 \"${env.WORKSPACE}\\verify_sca.bin\" ${env.JLINK_IDX}")
-              echo "  -> SCA dump: verify_sca.bin"
-
-              // Run verification script from tools/ (P1-1: extracted from inline writeFile)
-              // BL_ADDR is passed via environment variable
-              echo 'Running flash verification...'
-              bat '@"%VENV_PY%" "%TOOLS%\\verify_flash.py"'
-              echo '[PASS] Flash verification passed (MANDATORY GATE cleared)'
-            }
-          }
-        }
-
-        // --- 4.9 Reset (GR5xxx_console only, NO J-Link reset) ---
-        stage('4.9 Reset Device') {
-          steps {
-            echo '[Stage4.9] Resetting device (GR5xxx_console reset, NOT J-Link)'
-            echo 'HARD RULE: NO J-Link reset. Use GR5xxx_console reset only.'
-            script {
-              grConsole("reset 1 0")
-              echo 'Waiting 5s for GR5526 boot + RTT ready ...'
-              bat '@ping -n 6 127.0.0.1 >nul'
-              echo '[PASS] Device reset via GR5xxx_console'
-            }
-          }
-        }
-
-      }
     }
-
-    // ========================================================================
-    // Stage 5: Hardware Test (RTT diagnostic)
-    // ========================================================================
-    // P1-6 Test classification:
-    //   - Flash Verify (Stage 4.8)  -> MANDATORY (FAIL stops pipeline)
-    //   - Boot Test (RTT BL phase)  -> MANDATORY (covered by test_rtt_with_jump exit code)
-    //   - APP Functional Test       -> MANDATORY (covered by test_rtt_with_jump exit code)
-    //   - RTT Diagnostic (this stage) -> OPTIONAL / UNSTABLE
-    //
-    // RTT test failure does NOT fail the build (currentBuild.result = UNSTABLE).
-    // RTT provides diagnostic information. If RTT addr cannot be detected,
-    // output WARNING but do NOT fail.
-    stage('5. Hardware Test (RTT Diagnostic)') {
-      steps {
-        echo '[Stage5] RTT diagnostic test: read bootloader logs, wait for BL->App jump, read app logs'
-        echo 'NOTE: This is a DIAGNOSTIC test. Failure = UNSTABLE, not FAIL.'
-        script {
-          if (!env.BL_RTT_ADDR) {
-            echo '[WARN] BL_RTT_ADDR not detected. RTT diagnostic may not be able to run.'
-          }
-
-          def blRtt = env.BL_RTT_ADDR ?: '0x2000C830'
-          def appRtt = env.APP_RTT_ADDR ?: '0x2000D000'
-          def blKw = params.BL_KEYWORD ?: ''
-          def appKw = params.APP_KEYWORD ?: ''
-
-          if (params.DRY_RUN.toBoolean()) {
-            echo "[DRY-RUN] test_rtt_with_jump.py --bl-rtt-addr ${blRtt} --app-rtt-addr ${appRtt} --jlink-serial ${env.JLINK_SERIAL} --bl-keyword '${blKw}' --app-keyword '${appKw}' --output rtt_result.json"
-            echo "[DRY-RUN] Would: reset device, read BL RTT at ${blRtt}, wait for jump to App, read APP RTT at ${appRtt}"
-            echo "[DRY-RUN] Jump handling: monitor PC region (BL=0x00204000-0x0023FFFF, APP>=0x00240000), switch RTT addr on jump"
-          } else {
-            def testCmd = "@\"${env.VENV_PY}\" \"${env.TOOLS}\\test_rtt_with_jump.py\" --bl-rtt-addr ${blRtt} --app-rtt-addr ${appRtt} --jlink-serial ${env.JLINK_SERIAL} --bl-timeout 8 --jump-timeout 20 --output \"${env.WORKSPACE}\\rtt_result.json\""
-            if (blKw) { testCmd += " --bl-keyword \"${blKw}\"" }
-            if (appKw) { testCmd += " --app-keyword \"${appKw}\"" }
-
-            echo "Running RTT diagnostic (BL addr=${blRtt}, APP addr=${appRtt}) ..."
-            def testExit = bat(returnStatus: true, script: testCmd)
-            if (testExit != 0) {
-              echo "[WARN] RTT diagnostic exited with code ${testExit}. Check rtt_result.json for details."
-              // RTT is DIAGNOSTIC - do not fail the build. Report as UNSTABLE.
-              currentBuild.result = 'UNSTABLE'
-            } else {
-              echo '[PASS] RTT diagnostic passed (boot + app)'
-            }
-          }
-        }
-      }
-    }
-
-  }
-
-  post {
-    success {
-      echo 'gr5526-ci PASSED.'
-    }
-    failure {
-      echo 'gr5526-ci FAILED.'
-    }
-    unstable {
-      echo 'gr5526-ci UNSTABLE (RTT diagnostic may have failed).'
-    }
-    always {
-      echo "gr5526-ci done. DRY_RUN=${params.DRY_RUN} SKIP_BUILD=${params.SKIP_BUILD} SKIP_FLASH=${params.SKIP_FLASH}"
-      echo "BL build: ${env.BL_BUILD_STATUS ?: 'n/a'} | APP build: ${env.APP_BUILD_STATUS ?: 'n/a'}"
-
-      // P2-1: Generate standardized test_result.json for n8n/Dashboard/AI consumption.
-      // Format defined in ci/result_schema.json.
-      // P2-5: Future: POST this JSON to an n8n webhook endpoint.
-      //       Example: curl -X POST -H "Content-Type: application/json"
-      //                -d @artifacts/test_result.json http://n8n:5678/webhook/gr5526-ci
-      //       Webhook call is NOT implemented here (out of scope) - only data format.
-      echo '[Post] Generating test_result.json for CI result tracking...'
-      script {
-        try {
-          def flashStatus = params.SKIP_FLASH.toBoolean() ? 'SKIPPED' : (params.DRY_RUN.toBoolean() ? 'DRY_RUN' : (currentBuild.currentResult == 'FAILURE' ? 'FAIL' : 'PASS'))
-          def resultJson = [
-            job: env.JOB_NAME ?: 'gr5526-ci',
-            build_number: (env.BUILD_NUMBER ?: '0') as int,
-            git_commit: env.GIT_COMMIT ?: 'unknown',
-            chip: env.CHIP ?: 'GR5526',
-            hardware_agent: env.NODE_LABELS ?: 'gr5526-hw',
-            build_type: (env.BL_BUILD_STATUS ?: 'n/a') + '-' + (env.APP_BUILD_STATUS ?: 'n/a'),
-            flash: [
-              erase: flashStatus,
-              app_program: flashStatus,
-              boot_program: flashStatus,
-              verify: flashStatus,
-            ],
-            boot_test: params.DRY_RUN.toBoolean() ? 'DRY_RUN' : (currentBuild.result == 'UNSTABLE' ? 'WARNING' : 'PASS'),
-            app_test: params.DRY_RUN.toBoolean() ? 'DRY_RUN' : (currentBuild.result == 'UNSTABLE' ? 'WARNING' : 'PASS'),
-            rtt: [
-              status: currentBuild.result ?: 'PASS',
-              bl_rtt_addr: env.BL_RTT_ADDR ?: 'not-detected',
-              app_rtt_addr: env.APP_RTT_ADDR ?: 'not-detected',
-              notes: 'RTT is diagnostic/optional. UNSTABLE does not mean build failure.',
-            ],
-            warnings: [],
-            timestamp: new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
-          ]
-          writeFile file: "${env.ARTIFACTS}\\test_result.json", text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(resultJson))
-          echo '[PASS] test_result.json generated'
-        } catch (Exception e) {
-          echo "[WARN] Failed to generate test_result.json: ${e.getMessage()}"
-        }
-      }
-
-      // Archive artifacts
-      archiveArtifacts artifacts: 'artifacts/*.json,*.json,*.py,*.bin,verify_*.bin,rtt_result.json,obj_list.txt', allowEmptyArchive: true
-    }
-  }
 }
